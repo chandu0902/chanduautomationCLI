@@ -33,3 +33,6 @@ reports/
 
 # Backups (large generated folders)
 backups/
+
+# Large zip files
+*.zip
