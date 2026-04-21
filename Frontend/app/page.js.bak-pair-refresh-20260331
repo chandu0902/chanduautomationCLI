@@ -1,0 +1,753 @@
+"use client";
+
+import { useState, useEffect, useCallback, useMemo } from "react";
+import Sidebar from "@/components/Sidebar";
+import ExchangeSelector from "@/components/ExchangeSelector";
+import TypeSelector from "@/components/TypeSelector";
+import SymbolSelector from "@/components/SymbolSelector";
+import PairTable from "@/components/PairTable";
+import AccountManager from "@/components/AccountManager";
+import TradeLogsPage from "@/components/TradeLogsPage";
+import { api } from "@/lib/api";
+import { useOrderbook } from "@/lib/useOrderbook";
+
+function StatArbPage({ fetchPairs, sync, onNavigate }) {
+  const [exchange1, setExchange1] = useState("");
+  const [type1, setType1] = useState("");
+  const [symbol1, setSymbol1] = useState("");
+
+  const [exchange2, setExchange2] = useState("");
+  const [type2, setType2] = useState("");
+  const [symbol2, setSymbol2] = useState("");
+
+  const [agentName, setAgentName] = useState("");
+  const [tradeAccountA, setTradeAccountA] = useState("");
+  const [qty1, setQty1] = useState("");
+  const [tradeAccountB, setTradeAccountB] = useState("");
+  const [qty2, setQty2] = useState("");
+  const [maxQty1, setMaxQty1] = useState("");
+  const [beta, setBeta] = useState("");
+  const [accounts, setAccounts] = useState([]);
+
+  // Strategy parameters
+  const [profitTarget, setProfitTarget] = useState("");
+  const [stopLoss, setStopLoss] = useState("");
+  const [maxHoldHours, setMaxHoldHours] = useState("");
+  const [dailyLossLimitUsd, setDailyLossLimitUsd] = useState("");
+  const [zEntryThreshold, setZEntryThreshold] = useState("");
+  const [zEntryMax, setZEntryMax] = useState("");
+  const [maxLegAQty, setMaxLegAQty] = useState("");
+  const [maxLegBQty, setMaxLegBQty] = useState("");
+  const [maxPositions, setMaxPositions] = useState("");
+  const [spreadEntryLevels, setSpreadEntryLevels] = useState("");
+  const [maxSpreadCap, setMaxSpreadCap] = useState("");
+  const [entryPollTimeoutSec, setEntryPollTimeoutSec] = useState("");
+
+  const [saving, setSaving] = useState(false);
+
+  const fetchAccounts = useCallback(async () => {
+    try {
+      const data = await api.get("/api/accounts");
+      setAccounts(data);
+    } catch {
+      setAccounts([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAccounts();
+  }, [fetchAccounts]);
+
+  const handleExchange1Change = (val) => { setExchange1(val); setType1(""); setSymbol1(""); };
+  const handleType1Change = (val) => { setType1(val); setSymbol1(""); };
+  const handleExchange2Change = (val) => { setExchange2(val); setType2(""); setSymbol2(""); };
+  const handleType2Change = (val) => { setType2(val); setSymbol2(""); };
+
+  const handleSave = async () => {
+    setSaving(true);
+    const savedAgentName = agentName;
+    try {
+      await api.post("/api/pairs", {
+        exchange1, type1, symbol1,
+        exchange2, type2, symbol2,
+        agentName: agentName || null,
+        tradeAccountA: tradeAccountA || null,
+        qty1: qty1 ? parseFloat(qty1) : null,
+        tradeAccountB: tradeAccountB || null,
+        qty2: qty2 ? parseFloat(qty2) : null,
+        maxQty1: maxQty1 ? parseFloat(maxQty1) : null,
+        beta: isDifferentUnderlying && beta ? parseFloat(beta) : null,
+        dailyLossLimitPct: null,
+        profitTarget: profitTarget ? parseFloat(profitTarget) : null,
+        stopLoss: stopLoss ? parseFloat(stopLoss) : null,
+        maxHoldMs: maxHoldHours ? Math.round(parseFloat(maxHoldHours) * 3600000) : null,
+        dailyLossLimitUsd: dailyLossLimitUsd ? parseFloat(dailyLossLimitUsd) : null,
+        zEntryThreshold: zEntryThreshold ? parseFloat(zEntryThreshold) : null,
+        zEntryMax: zEntryMax ? parseFloat(zEntryMax) : null,
+        maxLegAQty: maxLegAQty ? parseFloat(maxLegAQty) : null,
+        maxLegBQty: maxLegBQty ? parseFloat(maxLegBQty) : null,
+        maxPositions: maxPositions ? parseInt(maxPositions) : null,
+        spreadEntryLevels: spreadEntryLevels || null,
+        maxSpreadCap: maxSpreadCap ? parseFloat(maxSpreadCap) : null,
+        entryPollTimeoutMs: entryPollTimeoutSec ? Math.round(parseFloat(entryPollTimeoutSec) * 1000) : null,
+      });
+      setExchange1(""); setType1(""); setSymbol1("");
+      setExchange2(""); setType2(""); setSymbol2("");
+      setAgentName(""); setTradeAccountA(""); setQty1(""); setTradeAccountB(""); setQty2(""); setMaxQty1(""); setBeta("");
+      setProfitTarget(""); setStopLoss(""); setMaxHoldHours(""); setDailyLossLimitUsd(""); setZEntryThreshold(""); setZEntryMax("");
+      setMaxLegAQty(""); setMaxLegBQty(""); setMaxPositions(""); setSpreadEntryLevels(""); setMaxSpreadCap(""); setEntryPollTimeoutSec("");
+      fetchPairs();
+      sync();
+      if (savedAgentName && onNavigate) {
+        onNavigate(`agent:${savedAgentName}`);
+      }
+    } catch (err) {
+      console.error("Failed to save pair:", err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const getBaseAsset = (symbol) => {
+    if (!symbol) return "";
+    return symbol.split(/[_-]/)[0];
+  };
+  const isDifferentUnderlying = symbol1 && symbol2 && getBaseAsset(symbol1) !== getBaseAsset(symbol2);
+  const allSelected = agentName && exchange1 && exchange2 && symbol1 && symbol2 && tradeAccountA && tradeAccountB && qty1 && qty2 && profitTarget && stopLoss && maxHoldHours && dailyLossLimitUsd && zEntryThreshold && maxPositions;
+
+  return (
+    <>
+      {/* Page Header */}
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h2 className="text-xl font-bold text-white">Create StatArb</h2>
+          <p className="text-sm text-slate-500">Configure exchange pairs for spread monitoring</p>
+        </div>
+      </div>
+
+      {/* Agent Name */}
+      <div className="mb-5">
+        <div className="card-hover rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-6">
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Agent Name</label>
+            <input
+              type="text"
+              value={agentName}
+              onChange={(e) => setAgentName(e.target.value)}
+              placeholder="Enter agent name"
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Exchange Cards */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+        <div className="card-hover rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-6 space-y-5">
+          <div className="flex items-center gap-2 pb-4 border-b border-slate-800/50">
+            <div className="w-6 h-6 rounded-md bg-blue-500/20 flex items-center justify-center">
+              <span className="text-xs font-bold text-blue-400">1</span>
+            </div>
+            <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Exchange 1</span>
+            {symbol1 && (
+              <span className="ml-auto text-xs font-mono text-emerald-400/80 bg-emerald-500/10 px-2.5 py-1 rounded-full">{symbol1}</span>
+            )}
+          </div>
+          <ExchangeSelector label="Exchange" value={exchange1} onChange={handleExchange1Change} />
+          <TypeSelector label="Type" exchange={exchange1} value={type1} onChange={handleType1Change} />
+          <SymbolSelector label="Symbol" exchange={exchange1} type={type1} value={symbol1} onChange={setSymbol1} />
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Trade Account</label>
+            <select
+              value={tradeAccountA}
+              onChange={(e) => setTradeAccountA(e.target.value)}
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all cursor-pointer"
+            >
+              <option value="">Select account</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.Trade_Account}>{a.Trade_Account} ({a.Exchange})</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Quantity</label>
+            <input
+              type="number"
+              value={qty1}
+              onChange={(e) => setQty1(e.target.value)}
+              placeholder="Enter quantity"
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+            />
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Max Quantity</label>
+            <input
+              type="number"
+              value={maxQty1}
+              onChange={(e) => setMaxQty1(e.target.value)}
+              placeholder="No limit"
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+            />
+          </div>
+        </div>
+
+        <div className="card-hover rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-6 space-y-5">
+          <div className="flex items-center gap-2 pb-4 border-b border-slate-800/50">
+            <div className="w-6 h-6 rounded-md bg-violet-500/20 flex items-center justify-center">
+              <span className="text-xs font-bold text-violet-400">2</span>
+            </div>
+            <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Exchange 2</span>
+            {symbol2 && (
+              <span className="ml-auto text-xs font-mono text-emerald-400/80 bg-emerald-500/10 px-2.5 py-1 rounded-full">{symbol2}</span>
+            )}
+          </div>
+          <ExchangeSelector label="Exchange" value={exchange2} onChange={handleExchange2Change} />
+          <TypeSelector label="Type" exchange={exchange2} value={type2} onChange={handleType2Change} />
+          <SymbolSelector label="Symbol" exchange={exchange2} type={type2} value={symbol2} onChange={setSymbol2} />
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Trade Account</label>
+            <select
+              value={tradeAccountB}
+              onChange={(e) => setTradeAccountB(e.target.value)}
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all cursor-pointer"
+            >
+              <option value="">Select account</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.Trade_Account}>{a.Trade_Account} ({a.Exchange})</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Quantity</label>
+            <input
+              type="number"
+              value={qty2}
+              onChange={(e) => setQty2(e.target.value)}
+              placeholder="Enter quantity"
+              className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Beta — only shown when underlying assets differ */}
+      {isDifferentUnderlying && (
+        <div className="mb-5">
+          <div className="card-hover rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-6">
+            <div className="flex items-center gap-2 pb-4 border-b border-slate-800/50">
+              <div className="w-6 h-6 rounded-md bg-amber-500/20 flex items-center justify-center">
+                <span className="text-xs font-bold text-amber-400">β</span>
+              </div>
+              <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Beta Coefficient</span>
+              <span className="ml-auto text-xs text-slate-600 font-mono">spread = {symbol1} − β × {symbol2}</span>
+            </div>
+            <div className="pt-4">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Beta Value</label>
+                <input
+                  type="number"
+                  step="any"
+                  value={beta}
+                  onChange={(e) => setBeta(e.target.value)}
+                  placeholder="Enter beta"
+                  className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500/40 transition-all"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Strategy Parameters */}
+      <div className="mb-5">
+        <div className="card-hover rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-6">
+          <div className="flex items-center gap-2 pb-4 border-b border-slate-800/50">
+            <div className="w-6 h-6 rounded-md bg-emerald-500/20 flex items-center justify-center">
+              <span className="text-xs font-bold text-emerald-400">S</span>
+            </div>
+            <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Strategy Parameters</span>
+          </div>
+          <div className="pt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Profit Target ($)</label>
+              <input
+                type="number" step="any" min="0"
+                value={profitTarget}
+                onChange={(e) => setProfitTarget(e.target.value)}
+                placeholder="e.g. 1.40"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Stop Loss ($)</label>
+              <input
+                type="number" step="any" min="0"
+                value={stopLoss}
+                onChange={(e) => setStopLoss(e.target.value)}
+                placeholder="e.g. 2.40"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-red-500/40 focus:border-red-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Time Stop (hours)</label>
+              <input
+                type="number" step="any" min="0"
+                value={maxHoldHours}
+                onChange={(e) => setMaxHoldHours(e.target.value)}
+                placeholder="e.g. 1"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500/40 transition-all"
+              />
+              {maxHoldHours && <p className="text-xs text-slate-500 font-mono">{Math.round(parseFloat(maxHoldHours) * 3600000).toLocaleString()} ms</p>}
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Z-Entry Threshold</label>
+              <input
+                type="number" step="any" min="0"
+                value={zEntryThreshold}
+                onChange={(e) => setZEntryThreshold(e.target.value)}
+                placeholder="e.g. 1.2"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Z-Entry Max</label>
+              <input
+                type="number" step="any" min="0"
+                value={zEntryMax}
+                onChange={(e) => setZEntryMax(e.target.value)}
+                placeholder="e.g. 4"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Max Positions</label>
+              <input
+                type="number" step="1" min="1"
+                value={maxPositions}
+                onChange={(e) => setMaxPositions(e.target.value)}
+                placeholder="e.g. 4"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Max Leg A Qty</label>
+              <input
+                type="number" step="any" min="0"
+                value={maxLegAQty}
+                onChange={(e) => setMaxLegAQty(e.target.value)}
+                placeholder="e.g. 2680"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Max Leg B Qty</label>
+              <input
+                type="number" step="any" min="0"
+                value={maxLegBQty}
+                onChange={(e) => setMaxLegBQty(e.target.value)}
+                placeholder="e.g. 2144"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Spread Entry Levels</label>
+              <input
+                type="text"
+                value={spreadEntryLevels}
+                onChange={(e) => setSpreadEntryLevels(e.target.value)}
+                placeholder="e.g. 40,55,70,85"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all"
+              />
+              <p className="text-xs text-slate-500 font-mono">Comma-separated dollar spread levels</p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Max Spread Cap ($)</label>
+              <input
+                type="number" step="any" min="0"
+                value={maxSpreadCap}
+                onChange={(e) => setMaxSpreadCap(e.target.value)}
+                placeholder="e.g. 120"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all"
+              />
+              <p className="text-xs text-slate-500 font-mono">Block entries above this dollar spread</p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-bold uppercase tracking-widest text-slate-500">Entry Poll Timeout (sec)</label>
+              <input
+                type="number" step="any" min="1"
+                value={entryPollTimeoutSec}
+                onChange={(e) => setEntryPollTimeoutSec(e.target.value)}
+                placeholder="e.g. 30"
+                className="w-full rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-3 text-sm font-mono placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-violet-500/40 focus:border-violet-500/40 transition-all"
+              />
+              <p className="text-xs text-slate-500 font-mono">Seconds to wait for legA fill before cancelling</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+
+      {/* Save Button */}
+      {allSelected && (
+        <div className="animate-fade-in mb-8">
+          <div className="rounded-2xl border border-slate-800/60 bg-gradient-to-r from-blue-500/5 via-slate-900/80 to-violet-500/5 p-5">
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div className="flex items-center gap-5 flex-wrap">
+                <div className="flex items-center gap-3 bg-slate-800/40 rounded-xl px-4 py-2.5 border border-slate-700/30">
+                  <div className="w-2 h-2 rounded-full bg-blue-400 glow-dot" />
+                  <div className="flex flex-col">
+                    <span className="text-xs text-slate-500 uppercase tracking-wider">{capitalize(exchange1)} / {type1.toUpperCase()}</span>
+                    <span className="text-base font-bold text-white font-mono">{symbol1}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-6 h-px bg-slate-700" />
+                  <span className="text-xs font-bold text-slate-600">VS</span>
+                  <div className="w-6 h-px bg-slate-700" />
+                </div>
+                <div className="flex items-center gap-3 bg-slate-800/40 rounded-xl px-4 py-2.5 border border-slate-700/30">
+                  <div className="w-2 h-2 rounded-full bg-violet-400 glow-dot" />
+                  <div className="flex flex-col">
+                    <span className="text-xs text-slate-500 uppercase tracking-wider">{capitalize(exchange2)} / {type2.toUpperCase()}</span>
+                    <span className="text-base font-bold text-white font-mono">{symbol2}</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                className="px-8 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-violet-600 text-white text-base font-semibold shadow-lg shadow-blue-500/20 hover:shadow-blue-500/30 hover:from-blue-400 hover:to-violet-500 transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {saving ? "Saving..." : "Save Pair"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function PairCard({ pair, onClick, sellSpreadData }) {
+  const isActive = pair.status === "active";
+  const capitalize = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
+  const pairKey = `${pair.exchange1}:${pair.symbol1}-${pair.exchange2}:${pair.symbol2}`;
+  const spreadEntry = sellSpreadData?.[pairKey];
+  const lastSpread = spreadEntry?.length > 0 ? spreadEntry[spreadEntry.length - 1] : null;
+
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left rounded-2xl border p-5 transition-all duration-200 cursor-pointer group ${
+        isActive
+          ? "border-emerald-500/20 bg-gradient-to-b from-emerald-500/5 to-slate-900/90 hover:border-emerald-500/30 hover:bg-emerald-500/10"
+          : "border-slate-800/60 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] hover:border-slate-700/60 hover:bg-slate-800/30"
+      }`}
+    >
+      {/* Status + spread */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <span className={`w-2 h-2 rounded-full ${isActive ? "bg-emerald-400" : "bg-slate-600"}`} />
+          <span className={`text-[10px] font-bold uppercase tracking-widest ${isActive ? "text-emerald-400/70" : "text-slate-600"}`}>
+            {isActive ? "Active" : "Inactive"}
+          </span>
+        </div>
+        {isActive && lastSpread && (
+          <span className="text-xs font-mono bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full">
+            {lastSpread.value?.toFixed(4)}%
+          </span>
+        )}
+      </div>
+
+      {/* Leg 1 */}
+      <div className="flex items-center gap-2 mb-2">
+        <div className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+        <span className="text-xs text-slate-500 uppercase">{capitalize(pair.exchange1)}</span>
+        <span className="text-sm font-bold text-blue-400 font-mono">{pair.symbol1}</span>
+      </div>
+
+      {/* VS */}
+      <div className="flex items-center gap-2 mb-2 pl-1">
+        <div className="w-4 h-px bg-slate-700" />
+        <span className="text-[10px] font-bold text-slate-600">VS</span>
+        <div className="w-4 h-px bg-slate-700" />
+      </div>
+
+      {/* Leg 2 */}
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-1.5 h-1.5 rounded-full bg-violet-400" />
+        <span className="text-xs text-slate-500 uppercase">{capitalize(pair.exchange2)}</span>
+        <span className="text-sm font-bold text-violet-400 font-mono">{pair.symbol2}</span>
+      </div>
+
+      {/* Accounts + Qty */}
+      <div className="border-t border-slate-800/50 pt-3 space-y-1">
+        {pair.tradeAccountA && (
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-slate-600 truncate">{pair.tradeAccountA}</span>
+            {pair.qty1 && <span className="text-[10px] font-mono text-slate-500">{pair.qty1}</span>}
+          </div>
+        )}
+        {pair.tradeAccountB && (
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-slate-600 truncate">{pair.tradeAccountB}</span>
+            {pair.qty2 && <span className="text-[10px] font-mono text-slate-500">{pair.qty2}</span>}
+          </div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function AgentDashboard({ agentName, pairs, tradeStates, onNavigate, sellSpreadData }) {
+  const [botLoading, setBotLoading] = useState(false);
+  const agentPairs = pairs.filter((p) => p.agentName === agentName);
+  const activePairs = agentPairs.filter((p) => p.status === "active");
+  const inactivePairs = agentPairs.filter((p) => p.status !== "active");
+
+  // Check how many pairs have trading enabled
+  const enabledCount = agentPairs.filter((p) => tradeStates?.[p.id]?.enabled).length;
+
+  const enableAll = async () => {
+    setBotLoading(true);
+    try {
+      await api.post(`/api/agents/${encodeURIComponent(agentName)}/trade/enable`);
+    } catch (err) {
+      console.error("Failed to enable agent:", err);
+    } finally {
+      setBotLoading(false);
+    }
+  };
+
+  const cancelAll = async () => {
+    setBotLoading(true);
+    try {
+      await api.post(`/api/agents/${encodeURIComponent(agentName)}/trade/disable`);
+    } catch (err) {
+      console.error("Failed to cancel agent:", err);
+    } finally {
+      setBotLoading(false);
+    }
+  };
+
+  return (
+    <>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-8">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-emerald-500/15 flex items-center justify-center border border-emerald-500/20">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-400">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83" />
+            </svg>
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-white">{agentName}</h2>
+            <p className="text-sm text-slate-500">
+              {agentPairs.length} pair{agentPairs.length !== 1 ? "s" : ""} &middot; {activePairs.length} active &middot; {enabledCount} trading
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {enabledCount > 0 ? (
+            <button
+              onClick={cancelAll}
+              disabled={botLoading}
+              className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-red-500 to-red-600 text-white text-sm font-semibold shadow-lg shadow-red-500/20 hover:from-red-400 hover:to-red-500 transition-all cursor-pointer disabled:opacity-50"
+            >
+              {botLoading ? "Cancelling..." : `Cancel All (${enabledCount})`}
+            </button>
+          ) : (
+            <button
+              onClick={enableAll}
+              disabled={botLoading || activePairs.length === 0}
+              className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 text-white text-sm font-semibold shadow-lg shadow-emerald-500/20 hover:from-emerald-400 hover:to-emerald-500 transition-all cursor-pointer disabled:opacity-50"
+            >
+              {botLoading ? "Enabling..." : `Enable All (${activePairs.length})`}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Active Pairs */}
+      {activePairs.length > 0 && (
+        <div className="mb-8">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+            <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">Active Pairs</h3>
+            <span className="text-xs text-slate-600 font-mono ml-1">({activePairs.length})</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {activePairs.map((p) => (
+              <PairCard
+                key={p.id}
+                pair={p}
+                sellSpreadData={sellSpreadData}
+                onClick={() => onNavigate(`pair:${p.id}`)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Inactive Pairs */}
+      {inactivePairs.length > 0 && (
+        <div>
+          <div className="flex items-center gap-2 mb-4">
+            <span className="w-2 h-2 rounded-full bg-slate-600" />
+            <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Inactive Pairs</h3>
+            <span className="text-xs text-slate-600 font-mono ml-1">({inactivePairs.length})</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {inactivePairs.map((p) => (
+              <PairCard
+                key={p.id}
+                pair={p}
+                onClick={() => onNavigate(`pair:${p.id}`)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {agentPairs.length === 0 && (
+        <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-12 text-center">
+          <p className="text-slate-500 text-sm">No pairs for this agent</p>
+        </div>
+      )}
+    </>
+  );
+}
+
+function PairDetailPage({ pairId, pairs, books, sellSpreadData, buySpreadData, sellExtremes, buyExtremes, midSpreadData, midExtremes, tradeStates, leadLag, accountInfo, fetchPairs, sync, onNavigate }) {
+  const pair = pairs.find((p) => String(p.id) === String(pairId));
+
+  if (!pair) {
+    return (
+      <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-12 text-center">
+        <p className="text-slate-500 text-sm">Pair not found</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* Back button */}
+      <button
+        onClick={() => onNavigate(pair.agentName ? `agent:${pair.agentName}` : "statarb")}
+        className="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 mb-6 transition-colors cursor-pointer"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+        Back to {pair.agentName || "StatArb"}
+      </button>
+
+      <PairTable
+        pairs={[pair]}
+        books={books}
+        sellSpreadData={sellSpreadData}
+        buySpreadData={buySpreadData}
+        sellExtremes={sellExtremes}
+        buyExtremes={buyExtremes}
+        midSpreadData={midSpreadData}
+        midExtremes={midExtremes}
+        tradeStates={tradeStates}
+        leadLag={leadLag}
+        accountInfo={accountInfo}
+        onUpdate={() => { fetchPairs(); sync(); }}
+      />
+    </>
+  );
+}
+
+function AccountsPage() {
+  return (
+    <>
+      <div className="mb-8">
+        <h2 className="text-xl font-bold text-white">Accounts</h2>
+        <p className="text-sm text-slate-500">Manage exchange API accounts for Hyperliquid and Deribit</p>
+      </div>
+      <AccountManager />
+    </>
+  );
+}
+
+export default function Home() {
+  const [activePage, setActivePage] = useState("statarb");
+  const [pairs, setPairs] = useState([]);
+  const { books, sellSpreadData, buySpreadData, sellExtremes, buyExtremes, midSpreadData, midExtremes, tradeStates, leadLag, accountInfo, sync } = useOrderbook();
+
+  const fetchPairs = useCallback(async () => {
+    try {
+      const data = await api.get("/api/pairs");
+      setPairs(data);
+    } catch {
+      setPairs([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPairs();
+  }, [fetchPairs]);
+
+  const allAgents = useMemo(() => {
+    const map = {};
+    for (const p of pairs) {
+      if (p.agentName) {
+        if (!map[p.agentName]) map[p.agentName] = { name: p.agentName, activeCount: 0 };
+        if (p.status === "active") map[p.agentName].activeCount++;
+      }
+    }
+    return Object.values(map).sort((a, b) => a.name.localeCompare(b.name));
+  }, [pairs]);
+
+  const orderbookProps = { books, sellSpreadData, buySpreadData, sellExtremes, buyExtremes, midSpreadData, midExtremes, tradeStates, leadLag, accountInfo, sync };
+
+  return (
+    <div className="min-h-screen relative overflow-hidden">
+      {/* Background glow effects */}
+      <div className="fixed inset-0 pointer-events-none">
+        <div className="absolute top-[-20%] left-[-10%] w-[500px] h-[500px] bg-blue-500/5 rounded-full blur-[120px]" />
+        <div className="absolute bottom-[-20%] right-[-10%] w-[500px] h-[500px] bg-violet-500/5 rounded-full blur-[120px]" />
+      </div>
+
+      <Sidebar active={activePage} onNavigate={setActivePage} allAgents={allAgents} />
+
+      {/* Main content */}
+      <div className="ml-[220px] relative">
+        <div className="max-w-[1920px] mx-auto px-8 py-8">
+          {activePage === "statarb" && (
+            <StatArbPage
+              fetchPairs={fetchPairs}
+              sync={sync}
+              onNavigate={setActivePage}
+            />
+          )}
+          {activePage === "accounts" && <AccountsPage />}
+          {activePage === "trades" && <TradeLogsPage pairs={pairs} />}
+          {activePage.startsWith("agent:") && (
+            <AgentDashboard
+              agentName={activePage.slice(6)}
+              pairs={pairs}
+              tradeStates={tradeStates}
+              sellSpreadData={sellSpreadData}
+              onNavigate={setActivePage}
+            />
+          )}
+          {activePage.startsWith("pair:") && (
+            <PairDetailPage
+              pairId={activePage.slice(5)}
+              pairs={pairs}
+              fetchPairs={fetchPairs}
+              {...orderbookProps}
+              onNavigate={setActivePage}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

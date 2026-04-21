@@ -1,0 +1,34 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Fastify backend with MySQL Sequelize",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "bot": "node telegram-bot.js",
+    "start": "node src/server.js",
+    "btc-report-telegram-agent": "node scripts/btcBotReportTelegramAgent.js",
+    "tune-live-spread": "node scripts/tuneSolLiveSpreadToBot.js 5",
+    "btc-master-report": "node scripts/report_btc_master_complete.js",
+    "btc-snapshot-yesterday": "node scripts/btcSnapshotSinceYesterday.js",
+    "btc-snapshot-24h": "node scripts/btcSnapshotSinceYesterday.js --hours=24",
+    "btc-snapshot-24h-stdout": "node scripts/btcSnapshotSinceYesterday.js --hours=24 --no-file",
+    "btc-exchange-trades-24h": "node scripts/btcExchangeRoundtripMetrics24h.js",
+    "btc-exchange-fills-report": "node scripts/btcExchangeLast24hFillsReport.js",
+    "btc-exchange-fills-report-yesterday": "node scripts/btcExchangeLast24hFillsReport.js --sinceUtcYesterday"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.79.0",
+    "@fastify/cors": "^9.0.1",
+    "@fastify/websocket": "^8.3.1",
+    "docx": "^9.6.1",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.0",
+    "hyperliquid": "^1.7.7",
+    "mysql2": "^3.11.0",
+    "node-telegram-bot-api": "^0.67.0",
+    "nodemon": "^3.1.14",
+    "sequelize": "^6.37.0",
+    "ws": "^8.19.0"
+  }
+}

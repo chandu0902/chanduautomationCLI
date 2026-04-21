@@ -1,0 +1,12 @@
+{
+  "crossPaper": {
+    "enabled": true,
+    "opts": {
+      "persistDb": true
+    }
+  },
+  "solPaper": {
+    "enabled": false,
+    "startBody": {}
+  }
+}

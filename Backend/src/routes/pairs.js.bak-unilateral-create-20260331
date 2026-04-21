@@ -1,0 +1,117 @@
+const { StatArbInput } = require('../models');
+const orderbookManager = require('../services/orderbookStreams');
+const { clearLogs } = require('../services/spreadFileLogger');
+
+async function syncStreams() {
+  const activeStatArbInputs = await StatArbInput.findAll({ where: { status: 'active' } });
+  orderbookManager.syncWithActivePairs(activeStatArbInputs);
+}
+
+async function pairRoutes(fastify, options) {
+  // GET /api/pairs
+  fastify.get('/api/pairs', async (request, reply) => {
+    const { status } = request.query;
+    const where = status ? { status } : {};
+    const pairs = await StatArbInput.findAll({ where, order: [['createdAt', 'DESC']] });
+    return pairs;
+  });
+
+  // POST /api/pairs
+  fastify.post('/api/pairs', async (request, reply) => {
+    const {
+      exchange1, type1, symbol1, exchange2, type2, symbol2,
+      agentName, tradeAccountA, qty1, tradeAccountB, qty2, beta, maxQty1, dailyLossLimitPct,
+      profitTarget, stopLoss, maxHoldMs, dailyLossLimitUsd,
+      zEntryThreshold, zEntryMax, maxLegAQty, maxLegBQty, maxPositions, spreadEntryLevels, maxSpreadCap, entryPollTimeoutMs,
+    } = request.body;
+    const pair = await StatArbInput.create({
+      exchange1, type1, symbol1,
+      exchange2, type2, symbol2,
+      agentName: agentName || null,
+      tradeAccountA: tradeAccountA || null,
+      qty1: qty1 || null,
+      tradeAccountB: tradeAccountB || null,
+      qty2: qty2 || null,
+      maxQty1: maxQty1 || null,
+      beta: beta != null ? beta : null,
+      dailyLossLimitPct: dailyLossLimitPct != null ? parseFloat(dailyLossLimitPct) : null,
+      profitTarget: profitTarget != null ? parseFloat(profitTarget) : null,
+      stopLoss: stopLoss != null ? parseFloat(stopLoss) : null,
+      maxHoldMs: maxHoldMs != null ? parseInt(maxHoldMs) : null,
+      dailyLossLimitUsd: dailyLossLimitUsd != null ? parseFloat(dailyLossLimitUsd) : null,
+      zEntryThreshold: zEntryThreshold != null ? parseFloat(zEntryThreshold) : null,
+      zEntryMax: zEntryMax != null ? parseFloat(zEntryMax) : null,
+      maxLegAQty: maxLegAQty != null ? parseFloat(maxLegAQty) : null,
+      maxLegBQty: maxLegBQty != null ? parseFloat(maxLegBQty) : null,
+      maxPositions: maxPositions != null ? parseInt(maxPositions) : null,
+      spreadEntryLevels: spreadEntryLevels || null,
+      maxSpreadCap: maxSpreadCap != null ? parseFloat(maxSpreadCap) : null,
+      entryPollTimeoutMs: entryPollTimeoutMs != null ? parseInt(entryPollTimeoutMs) : null,
+      status: 'active',
+    });
+    await syncStreams();
+    return reply.status(201).send(pair);
+  });
+
+  // PUT /api/pairs/:id — edit pair config
+  fastify.put('/api/pairs/:id', async (request, reply) => {
+    const { id } = request.params;
+    const pair = await StatArbInput.findByPk(id);
+    if (!pair) {
+      return reply.status(404).send({ error: 'StatArbInput not found' });
+    }
+    const floatFields = ['qty1', 'qty2', 'maxQty1', 'beta', 'dailyLossLimitPct', 'profitTarget', 'stopLoss', 'dailyLossLimitUsd', 'zEntryThreshold', 'zEntryMax', 'maxLegAQty', 'maxLegBQty', 'maxSpreadCap'];
+    const intFields   = ['maxHoldMs', 'maxPositions'];
+    const strFields   = ['spreadEntryLevels'];
+    const updates = {};
+    for (const key of floatFields) {
+      if (request.body[key] !== undefined) {
+        updates[key] = request.body[key] === '' || request.body[key] === null ? null : parseFloat(request.body[key]);
+      }
+    }
+    for (const key of intFields) {
+      if (request.body[key] !== undefined) {
+        updates[key] = request.body[key] === '' || request.body[key] === null ? null : parseInt(request.body[key]);
+      }
+    }
+    for (const key of strFields) {
+      if (request.body[key] !== undefined) {
+        updates[key] = request.body[key] === '' || request.body[key] === null ? null : request.body[key];
+      }
+    }
+    await pair.update(updates);
+    return pair;
+  });
+
+  // PUT /api/pairs/:id/status
+  fastify.put('/api/pairs/:id/status', async (request, reply) => {
+    const { id } = request.params;
+    const { status } = request.body;
+    const pair = await StatArbInput.findByPk(id);
+    if (!pair) {
+      return reply.status(404).send({ error: 'StatArbInput not found' });
+    }
+    await pair.update({ status });
+    if (status === 'inactive') {
+      clearLogs(id);
+    }
+    await syncStreams();
+    return pair;
+  });
+
+  // DELETE /api/pairs/:id
+  fastify.delete('/api/pairs/:id', async (request, reply) => {
+    const { id } = request.params;
+    const pair = await StatArbInput.findByPk(id);
+    if (!pair) {
+      return reply.status(404).send({ error: 'StatArbInput not found' });
+    }
+    orderbookManager.unsubscribe(id);
+    clearLogs(id);
+    await pair.destroy();
+    await syncStreams();
+    return { message: 'StatArbInput deleted' };
+  });
+}
+
+module.exports = pairRoutes;

@@ -1,0 +1,164 @@
+const { DataTypes } = require('sequelize');
+const sequelize = require('../config/database');
+
+const Trade = sequelize.define('Trade', {
+  id: {
+    type: DataTypes.INTEGER,
+    autoIncrement: true,
+    primaryKey: true,
+  },
+  pairId: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+  },
+  side: {
+    type: DataTypes.ENUM('entry', 'exit'),
+    allowNull: false,
+  },
+  legA_exchange: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  legA_symbol: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  legA_side: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  legA_price: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legA_qty: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legA_orderId: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legA_filledAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  legB_exchange: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legB_symbol: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legB_side: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legB_price: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legB_qty: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legB_orderId: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legB_filledAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  zScoreAtEntry: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  spreadAtEntry: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Implied carry rate % p.a. at position entry',
+  },
+  spreadAtExit: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Implied carry rate % p.a. at position exit',
+  },
+  pnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legA_pnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legB_pnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legA_buyVwap: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legA_sellVwap: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legB_buyVwap: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  legB_sellVwap: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  status: {
+    type: DataTypes.ENUM('open', 'closed', 'failed', 'cancelled', 'filled'),
+    defaultValue: 'open',
+  },
+  legA_fillType: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  legB_fillType: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  balanceBefore: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  balanceAfter: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  exchangePnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  commission: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Maker rebate earned in USD (positive = income received); added to net P&L',
+  },
+  takerFeeUsd: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Taker fee paid in USD for legB execution (positive = cost subtracted from net P&L)',
+  },
+  cancelReason: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    comment: 'Reason when status=cancelled (e.g. entry_timeout_unfilled, fill_quality_reject)',
+  },
+}, {
+  tableName: 'trade_logs',
+  timestamps: true,
+  indexes: [
+    { fields: ['pairId'] },
+    { fields: ['status'] },
+  ],
+});
+
+module.exports = Trade;

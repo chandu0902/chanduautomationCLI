@@ -1,0 +1,624 @@
+const crypto = require('crypto');
+const {
+  buyorder,
+  sellorder,
+  cancelorder,
+  deribitorderStatus,
+  signedRequest,
+} = require('../controllers/apicontroller');
+const { StatArbInput, AccountDetails } = require('../models');
+const Trade = require('../models/Trade');
+const BasisPosition = require('../models/BasisPosition');
+
+const POLL_MS = 1500;
+const ENTRY_TIMEOUT_MS = 45000;
+const EXIT_TIMEOUT_MS = 30000;
+const COOLDOWN_MS = 30000;
+
+function decryptText(keyBase64, encryptedText, ivBase64) {
+  const key = Buffer.from(keyBase64, 'base64');
+  const iv = Buffer.from(ivBase64, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+  let decrypted = decipher.update(encryptedText, 'base64', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
+async function getApiCredentials(account) {
+  const [ak0, ak1, ak2] = account.Api_Key.split(',', 3);
+  const apiKey = decryptText(ak2, ak1, ak0);
+  const [sk0, sk1, sk2] = account.Secret_Key.split(',', 3);
+  const secretKey = decryptText(sk2, sk1, sk0);
+  return { apiKey, secretKey };
+}
+
+class UniState {
+  constructor(pairId) {
+    this.pairId = pairId;
+    this.enabled = false;
+    this.enabledAt = null;
+    this.pair = null;
+    this.clientA = null;
+    this.lastOrderbooks = null;
+    this.openPositions = [];
+    this.levelQty = [];
+    this.levels = [];
+    this.prevSignalSpread = null;
+    this.lastEntryAt = 0;
+    this.filledQty = 0;
+    this.tpSpreadDelta = null;
+    this.slSpreadDelta = null;
+    this.entryTimeoutMs = ENTRY_TIMEOUT_MS;
+    this._entryInFlight = false;
+    this.tradeLeg = 'A';
+    this.tradeSymbol = null;
+  }
+}
+
+class UnilateralExecutor {
+  constructor() {
+    this.pairs = new Map();
+    this.startedAt = Date.now();
+  }
+
+  _broadcastState(pairId) {
+    try {
+      const orderbookManager = require('./orderbookStreams');
+      orderbookManager.broadcast({ type: 'trade_state', pairId, ...this.getState(pairId) });
+    } catch (_) { }
+  }
+
+  async _placeLimit(state, side, qty, price) {
+    const cred = state.clientA;
+    const symbol = state.tradeSymbol || state.pair.symbol1;
+    const result = side === 'buy'
+      ? await buyorder(symbol, qty, 'limit', price, cred.apiKey, cred.secretKey)
+      : await sellorder(symbol, qty, 'limit', price, cred.apiKey, cred.secretKey);
+    const order = result?.result?.order;
+    return {
+      orderId: order?.order_id || null,
+      state: order?.order_state || null,
+      avgPrice: order?.average_price || order?.price || price,
+    };
+  }
+
+  async _cancel(state, orderId) {
+    if (!orderId) return;
+    await cancelorder(orderId, state.clientA.apiKey, state.clientA.secretKey).catch(() => { });
+  }
+
+  async _orderStatus(state, orderId) {
+    const resp = await deribitorderStatus(orderId, state.clientA.apiKey, state.clientA.secretKey);
+    let r = resp?.result;
+    if (Array.isArray(r)) r = r[0];
+    if (!r) return { status: 'unknown', filledPrice: null };
+    const s = (r.order_state || '').toLowerCase();
+    if (s === 'filled') return { status: 'filled', filledPrice: parseFloat(r.average_price || r.price || 0) || null };
+    if (s === 'cancelled' || s === 'canceled' || s === 'rejected') return { status: 'cancelled', filledPrice: null };
+    return { status: 'open', filledPrice: null };
+  }
+
+  async _getOrderCommissionUsd(state, orderId, fallbackPrice) {
+    if (!orderId) return null;
+    try {
+      const resp = await signedRequest(
+        `/api/v2/private/get_user_trades_by_order?order_id=${orderId}`,
+        state.clientA.apiKey,
+        state.clientA.secretKey
+      );
+      const fills = Array.isArray(resp?.result) ? resp.result : [];
+      if (fills.length === 0) return null;
+      let totalUsd = 0;
+      for (const f of fills) {
+        const fee = Number(f?.fee ?? 0); // Deribit rebates are negative in fee currency.
+        if (!Number.isFinite(fee)) continue;
+        const feeCurrency = String(f?.fee_currency || '').toUpperCase();
+        const px = Number(f?.price ?? fallbackPrice ?? 0);
+        if (feeCurrency === 'BTC' && px > 0) {
+          totalUsd += Math.abs(fee) * px;
+        } else {
+          totalUsd += Math.abs(fee);
+        }
+      }
+      return Number.isFinite(totalUsd) ? parseFloat(totalUsd.toFixed(6)) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _parseLevels(pair) {
+    const levels = String(pair.spreadEntryLevels || '')
+      .split(',')
+      .map((x) => parseFloat(x))
+      .filter((x) => Number.isFinite(x) && x > 0)
+      .sort((a, b) => a - b);
+    return levels;
+  }
+
+  _computeLevelQty(pair, levels) {
+    const totalWeight = levels.reduce((a, b) => a + b, 0) || 1;
+    return levels.map((lvl) => Math.max(10, Math.round((pair.qty1 * lvl) / totalWeight / 10) * 10));
+  }
+
+  async enableTrading(pairId) {
+    const pair = await StatArbInput.findByPk(pairId);
+    if (!pair) return { success: false, message: 'Pair not found' };
+    if (!pair.unilateralMode) return { success: false, message: 'Pair is not unilateralMode' };
+    const levels = this._parseLevels(pair);
+    if (levels.length === 0) return { success: false, message: 'Invalid spreadEntryLevels' };
+    const acc = await AccountDetails.findOne({ where: { Trade_Account: pair.tradeAccountA } });
+    if (!acc) return { success: false, message: `Account not found: ${pair.tradeAccountA}` };
+    const clientA = await getApiCredentials(acc);
+
+    let state = this.pairs.get(pairId);
+    if (!state) {
+      state = new UniState(pairId);
+      this.pairs.set(pairId, state);
+    }
+    state.enabled = true;
+    state.enabledAt = Date.now();
+    state.pair = pair;
+    state.clientA = clientA;
+    state.levels = levels;
+    state.levelQty = this._computeLevelQty(pair, levels);
+    state.tpSpreadDelta = pair.tpSpreadDelta != null ? parseFloat(pair.tpSpreadDelta) : 20;
+    state.slSpreadDelta = pair.slSpreadDelta != null ? parseFloat(pair.slSpreadDelta) : 35;
+    state.entryTimeoutMs = pair.entryPollTimeoutMs != null ? parseInt(pair.entryPollTimeoutMs) : ENTRY_TIMEOUT_MS;
+    state.tradeLeg = (pair.tradeLeg || 'A').toUpperCase() === 'B' ? 'B' : 'A';
+    state.tradeSymbol = state.tradeLeg === 'B' ? pair.symbol2 : pair.symbol1;
+    state.prevSignalSpread = null;
+    state._entryInFlight = false;
+    this._broadcastState(pairId);
+    return { success: true, message: `Unilateral trading enabled (tradeLeg=${state.tradeLeg})`, pairId };
+  }
+
+  async disableTrading(pairId) {
+    const state = this.pairs.get(pairId);
+    if (!state || !state.enabled) return { success: false, message: 'Trading not enabled for this pair' };
+    state.enabled = false;
+    for (const pos of state.openPositions) {
+      if (pos.pollTimer) clearInterval(pos.pollTimer);
+      if (pos.entryOrderId) await this._cancel(state, pos.entryOrderId);
+      if (pos.exitOrderId) await this._cancel(state, pos.exitOrderId);
+    }
+    state.openPositions = [];
+    this._broadcastState(pairId);
+    return { success: true, message: 'Trading disabled' };
+  }
+
+  getState(pairId) {
+    const state = this.pairs.get(pairId);
+    if (!state) return { pairId, enabled: false, state: 'IDLE' };
+    return {
+      pairId,
+      enabled: !!state.enabled,
+      enabledAt: state.enabledAt,
+      state: state.openPositions.some((p) => p.status === 'open') ? 'POSITION_OPEN' : 'IDLE',
+      filledQty: state.filledQty,
+      unilateralMode: true,
+      tpSpreadDelta: state.tpSpreadDelta,
+      slSpreadDelta: state.slSpreadDelta,
+      positions: state.openPositions.filter((p) => p.status === 'open').map((p) => ({
+        gridLevel: p.gridLevel,
+        fillSpread: p.fillSpread,
+        bestSpread: p.bestSpread,
+        profitTicks: p.profitTicks,
+        stopTicks: p.stopTicks,
+      })),
+    };
+  }
+
+  async _startEntry(state, levelIdx, signalSpread) {
+    const pair = state.pair;
+    const ob1 = state.lastOrderbooks?.leg1;
+    const ob2 = state.lastOrderbooks?.leg2;
+    const futAsk = parseFloat(ob1?.asks?.[0]?.price || 0);
+    const perpBid = parseFloat(ob2?.bids?.[0]?.price || 0);
+    if (!futAsk || !perpBid) return;
+
+    const qty = state.levelQty[levelIdx] || pair.qty1;
+    const level = state.levels[levelIdx];
+    const isLegB = state.tradeLeg === 'B';
+
+    // LegA (default): SELL futures at ask | LegB: BUY perp at bid
+    const entrySide = isLegB ? 'buy' : 'sell';
+    const entryPrice = isLegB ? perpBid : futAsk;
+    const entryRes = await this._placeLimit(state, entrySide, qty, entryPrice);
+    if (!entryRes.orderId) return;
+
+    const tradedExchange = isLegB ? pair.exchange2 : pair.exchange1;
+    const tradedSymbol = isLegB ? pair.symbol2 : pair.symbol1;
+    const signalExchange = isLegB ? pair.exchange1 : pair.exchange2;
+    const signalSymbol = isLegB ? pair.symbol1 : pair.symbol2;
+
+    const trade = await Trade.create({
+      pairId: state.pairId,
+      side: 'entry',
+      legA_exchange: tradedExchange,
+      legA_symbol: tradedSymbol,
+      legA_side: entrySide,
+      legA_price: entryPrice,
+      legA_qty: qty,
+      legA_orderId: entryRes.orderId,
+      legA_fillType: 'maker',
+      legB_exchange: signalExchange,
+      legB_symbol: signalSymbol,
+      legB_side: isLegB ? 'sell' : 'buy',
+      legB_price: isLegB ? futAsk : perpBid,
+      legB_qty: 0,
+      legB_fillType: 'signal',
+      spreadAtEntry: signalSpread,
+      status: 'open',
+    });
+    const bp = await BasisPosition.create({
+      pairId: state.pairId,
+      entryTradeId: trade.id,
+      direction: 'long',
+      gridLevel: levelIdx + 1,
+      state: 'pending_entry',
+      entrySpread: signalSpread,
+      legA_entryPrice: entryPrice,
+      legA_entryQty: qty,
+      legB_entryPrice: isLegB ? futAsk : perpBid,
+      legB_entryQty: 0,
+      legA_entryOrderId: entryRes.orderId,
+      entryTime: new Date(),
+    });
+
+    const pos = {
+      id: `${Date.now()}_${Math.random()}`,
+      status: 'pending_entry',
+      gridLevel: levelIdx + 1,
+      level,
+      qty,
+      entryOrderId: entryRes.orderId,
+      entryTradeId: trade.id,
+      basisPositionId: bp.id,
+      entrySignalSpread: signalSpread,
+      entryPriceA: null,
+      entryPriceB: null,
+      fillSpread: null,
+      bestSpread: null,
+      entryCommissionUsd: null,
+      profitTicks: 0,
+      stopTicks: 0,
+      pollTimer: null,
+      pollStart: Date.now(),
+      exitOrderId: null,
+      exitTradeId: null,
+    };
+    state.openPositions.push(pos);
+    state.lastEntryAt = Date.now();
+    this._pollEntry(state, pos);
+  }
+
+  _pollEntry(state, pos) {
+    if (pos.pollTimer) clearInterval(pos.pollTimer);
+    const isLegB = state.tradeLeg === 'B';
+    pos.pollTimer = setInterval(async () => {
+      if (!state.enabled) {
+        clearInterval(pos.pollTimer);
+        return;
+      }
+      if (Date.now() - pos.pollStart > (state.entryTimeoutMs || ENTRY_TIMEOUT_MS)) {
+        clearInterval(pos.pollTimer);
+        await this._cancel(state, pos.entryOrderId);
+        await Trade.update({
+          status: 'cancelled',
+          cancelReason: 'entry_timeout_unfilled',
+        }, { where: { id: pos.entryTradeId } }).catch(() => { });
+        await BasisPosition.update({ state: 'failed' }, { where: { id: pos.basisPositionId } }).catch(() => { });
+        pos.status = 'closed';
+        state.openPositions = state.openPositions.filter((p) => p !== pos);
+        return;
+      }
+      const st = await this._orderStatus(state, pos.entryOrderId);
+      if (st.status !== 'filled') return;
+      clearInterval(pos.pollTimer);
+
+      // Reference price from the non-traded leg
+      const ob1 = state.lastOrderbooks?.leg1;
+      const ob2 = state.lastOrderbooks?.leg2;
+      const refPrice = isLegB
+        ? parseFloat(ob1?.asks?.[0]?.price || 0)   // futures ask as reference
+        : parseFloat(ob2?.bids?.[0]?.price || 0);   // perp bid as reference
+      if (!refPrice) return;
+
+      pos.entryPriceA = st.filledPrice;
+      pos.entryPriceB = refPrice;
+      // fillSpread is always futures - perp regardless of which leg is traded
+      pos.fillSpread = isLegB
+        ? parseFloat((refPrice - st.filledPrice).toFixed(4))
+        : parseFloat((st.filledPrice - refPrice).toFixed(4));
+      pos.bestSpread = pos.fillSpread;
+
+      const minReq = pos.level * 0.85;
+      if (pos.fillSpread < minReq) {
+        // Quality reject: unwind with maker-only close
+        const closeSide = isLegB ? 'sell' : 'buy';
+        const closePrice = isLegB
+          ? parseFloat(ob2?.asks?.[0]?.price || pos.entryPriceA)
+          : parseFloat(ob1?.bids?.[0]?.price || pos.entryPriceA);
+        await this._placeLimit(state, closeSide, pos.qty, closePrice).catch(() => { });
+        await Trade.update({
+          status: 'cancelled',
+          cancelReason: 'fill_quality_reject',
+        }, { where: { id: pos.entryTradeId } }).catch(() => { });
+        await BasisPosition.update({ state: 'failed' }, { where: { id: pos.basisPositionId } }).catch(() => { });
+        pos.status = 'closed';
+        state.openPositions = state.openPositions.filter((p) => p !== pos);
+        return;
+      }
+
+      const entryCommission = await this._getOrderCommissionUsd(state, pos.entryOrderId, pos.entryPriceA);
+      pos.entryCommissionUsd = entryCommission;
+      await Trade.update({
+        status: 'filled',
+        legA_price: pos.entryPriceA,
+        legA_filledAt: new Date(),
+        legB_price: pos.entryPriceB,
+        legB_filledAt: new Date(),
+        commission: entryCommission,
+      }, { where: { id: pos.entryTradeId } }).catch(() => { });
+      await BasisPosition.update({
+        state: 'open',
+        legA_entryPrice: pos.entryPriceA,
+        legB_entryPrice: pos.entryPriceB,
+      }, { where: { id: pos.basisPositionId } }).catch(() => { });
+      pos.status = 'open';
+      state.filledQty += pos.qty;
+      this._broadcastState(state.pairId);
+    }, POLL_MS);
+  }
+
+  async _startExit(state, pos, reason) {
+    const pair = state.pair;
+    const ob1 = state.lastOrderbooks?.leg1;
+    const ob2 = state.lastOrderbooks?.leg2;
+    const futBid = parseFloat(ob1?.bids?.[0]?.price || 0);
+    const perpAsk = parseFloat(ob2?.asks?.[0]?.price || 0);
+    const perpBid = parseFloat(ob2?.bids?.[0]?.price || pos.entryPriceB || 0);
+    const isLegB = state.tradeLeg === 'B';
+
+    // LegA (default): BUY futures at bid | LegB: SELL perp at ask
+    const exitSide = isLegB ? 'sell' : 'buy';
+    const exitPrice = isLegB ? perpAsk : futBid;
+    if (!exitPrice || !futBid || !perpBid) return;
+
+    const res = await this._placeLimit(state, exitSide, pos.qty, exitPrice);
+    if (!res.orderId) return;
+
+    const tradedExchange = isLegB ? pair.exchange2 : pair.exchange1;
+    const tradedSymbol = isLegB ? pair.symbol2 : pair.symbol1;
+    const signalExchange = isLegB ? pair.exchange1 : pair.exchange2;
+    const signalSymbol = isLegB ? pair.symbol1 : pair.symbol2;
+    const signalPrice = isLegB ? futBid : perpBid;
+    const exitSpreadNow = parseFloat((futBid - perpBid).toFixed(4));
+
+    const exitTrade = await Trade.create({
+      pairId: state.pairId,
+      side: 'exit',
+      legA_exchange: tradedExchange,
+      legA_symbol: tradedSymbol,
+      legA_side: exitSide,
+      legA_price: exitPrice,
+      legA_qty: pos.qty,
+      legA_orderId: res.orderId,
+      legA_fillType: 'maker',
+      legB_exchange: signalExchange,
+      legB_symbol: signalSymbol,
+      legB_side: isLegB ? 'buy' : 'sell',
+      legB_price: signalPrice,
+      legB_qty: 0,
+      legB_fillType: 'signal',
+      spreadAtEntry: pos.entrySignalSpread,
+      spreadAtExit: exitSpreadNow,
+      status: 'open',
+    });
+    pos.status = 'pending_exit';
+    pos.exitReason = reason;
+    pos.exitOrderId = res.orderId;
+    pos.exitTradeId = exitTrade.id;
+    pos.pollStart = Date.now();
+    this._pollExit(state, pos);
+  }
+
+  _pollExit(state, pos) {
+    if (pos.pollTimer) clearInterval(pos.pollTimer);
+    const isLegB = state.tradeLeg === 'B';
+    pos.pollTimer = setInterval(async () => {
+      if (!state.enabled) {
+        clearInterval(pos.pollTimer);
+        return;
+      }
+      if (Date.now() - pos.pollStart > EXIT_TIMEOUT_MS) {
+        await this._cancel(state, pos.exitOrderId);
+        // Re-place exit order at current best price
+        const ob1 = state.lastOrderbooks?.leg1;
+        const ob2 = state.lastOrderbooks?.leg2;
+        const newPrice = isLegB
+          ? parseFloat(ob2?.asks?.[0]?.price || 0)
+          : parseFloat(ob1?.bids?.[0]?.price || 0);
+        if (newPrice > 0) {
+          const exitSide = isLegB ? 'sell' : 'buy';
+          const re = await this._placeLimit(state, exitSide, pos.qty, newPrice);
+          if (re.orderId) {
+            pos.exitOrderId = re.orderId;
+            pos.pollStart = Date.now();
+            await Trade.update({ legA_orderId: re.orderId, legA_price: newPrice }, { where: { id: pos.exitTradeId } }).catch(() => { });
+          }
+        }
+        return;
+      }
+      const st = await this._orderStatus(state, pos.exitOrderId);
+      if (st.status !== 'filled') return;
+      clearInterval(pos.pollTimer);
+
+      const ob1 = state.lastOrderbooks?.leg1;
+      const ob2 = state.lastOrderbooks?.leg2;
+      const refPrice = isLegB
+        ? parseFloat(ob1?.bids?.[0]?.price || pos.entryPriceB || 0)
+        : parseFloat(ob2?.bids?.[0]?.price || pos.entryPriceB || 0);
+      const exitPriceA = st.filledPrice;
+
+      // exitSpread is always futures - perp
+      const exitSpread = isLegB
+        ? parseFloat((refPrice - exitPriceA).toFixed(4))
+        : parseFloat((exitPriceA - refPrice).toFixed(4));
+
+      // Deribit inverse PnL:
+      //   Short futures (legA default): qty * (1/exit - 1/entry)
+      //   Long perp (legB):             qty * (1/entry - 1/exit)
+      const pnlBtc = isLegB
+        ? parseFloat((pos.qty * (1 / pos.entryPriceA - 1 / exitPriceA)).toFixed(8))
+        : parseFloat((pos.qty * (1 / exitPriceA - 1 / pos.entryPriceA)).toFixed(8));
+      const grossPnl = parseFloat((pnlBtc * exitPriceA).toFixed(6));
+      const exitCommission = await this._getOrderCommissionUsd(state, pos.exitOrderId, exitPriceA);
+      const totalCommission = parseFloat((((pos.entryCommissionUsd || 0) + (exitCommission || 0))).toFixed(6));
+      const netPnl = parseFloat((grossPnl + totalCommission).toFixed(6));
+
+      await Trade.update({
+        status: 'filled',
+        legA_price: exitPriceA,
+        legA_filledAt: new Date(),
+        legB_price: refPrice,
+        legB_filledAt: new Date(),
+        spreadAtExit: exitSpread,
+        legA_pnl: grossPnl,
+        legB_pnl: 0,
+        pnl: netPnl,
+        commission: exitCommission,
+      }, { where: { id: pos.exitTradeId } }).catch(() => { });
+
+      await BasisPosition.update({
+        state: 'closed',
+        exitTradeId: pos.exitTradeId,
+        exitSpread,
+        exitReason: pos.exitReason || null,
+        legA_exitPrice: exitPriceA,
+        legB_exitPrice: refPrice,
+        legA_exitOrderId: pos.exitOrderId,
+        exitTime: new Date(),
+        holdMs: Date.now() - (new Date(pos.entryTime || Date.now()).getTime()),
+        spreadChange: parseFloat((exitSpread - pos.entrySignalSpread).toFixed(4)),
+        legA_pnl: grossPnl,
+        legB_pnl: 0,
+        grossPnl,
+        commission: totalCommission,
+        takerFeeUsd: 0,
+        netPnl,
+      }, { where: { id: pos.basisPositionId } }).catch(() => { });
+      pos.status = 'closed';
+      state.openPositions = state.openPositions.filter((p) => p !== pos);
+      this._broadcastState(state.pairId);
+    }, POLL_MS);
+  }
+
+  async onSpreadUpdate(pairId, sellStats, _buyStats, ctx = {}) {
+    const state = this.pairs.get(pairId);
+    if (!state || !state.enabled) return;
+    state.lastOrderbooks = { leg1: ctx.leg1, leg2: ctx.leg2 };
+    const ob1 = ctx.leg1;
+    const ob2 = ctx.leg2;
+    const futAsk = parseFloat(ob1?.asks?.[0]?.price || 0);
+    const futBid = parseFloat(ob1?.bids?.[0]?.price || 0);
+    const perpBid = parseFloat(ob2?.bids?.[0]?.price || 0);
+    if (!futAsk || !futBid || !perpBid) return;
+
+    const signalSpread = parseFloat((futAsk - perpBid).toFixed(4));
+
+    // Exit checks first — trailing stop-loss from best spread seen
+    const SL_CONFIRM_TICKS = 4;
+    const TP_CONFIRM_TICKS = 2;
+    // Trailing SL retracement: SL fires when spread retraces this much from the best
+    const TRAILING_SL_RETRACE = 0.40; // 40% retrace from best improvement triggers SL
+
+    for (const pos of state.openPositions) {
+      if (pos.status !== 'open') continue;
+      const currentSpread = signalSpread;
+
+      // Update best (most favorable) spread: lower = better for short-basis strategy
+      if (pos.bestSpread == null) pos.bestSpread = pos.fillSpread;
+      if (currentSpread < pos.bestSpread) pos.bestSpread = currentSpread;
+
+      const tpHit = (pos.fillSpread - currentSpread) >= state.tpSpreadDelta;
+
+      // Two-tier stop-loss:
+      // 1. Hard SL: absolute max loss from entry (slSpreadDelta from fillSpread)
+      // 2. Trailing SL: if spread improved significantly then retraced
+      const hardSlHit = (currentSpread - pos.fillSpread) >= state.slSpreadDelta;
+      const improvement = pos.fillSpread - pos.bestSpread;
+      const retracement = currentSpread - pos.bestSpread;
+      const trailingSlHit = improvement > (state.tpSpreadDelta * 0.5)
+        && retracement > (improvement * TRAILING_SL_RETRACE);
+      const slHit = hardSlHit || trailingSlHit;
+
+      if (tpHit) {
+        pos.profitTicks = (pos.profitTicks || 0) + 1;
+        pos.stopTicks = 0;
+      } else if (slHit) {
+        pos.stopTicks = (pos.stopTicks || 0) + 1;
+        pos.profitTicks = 0;
+      } else {
+        pos.profitTicks = 0;
+        pos.stopTicks = 0;
+      }
+      if (pos.profitTicks >= TP_CONFIRM_TICKS) await this._startExit(state, pos, 'profit');
+      else if (pos.stopTicks >= SL_CONFIRM_TICKS) {
+        const reason = trailingSlHit && !hardSlHit ? 'trailing_stop' : 'stop';
+        await this._startExit(state, pos, reason);
+      }
+    }
+
+    // Entry checks
+    const now = Date.now();
+    const z = sellStats?.zScore ?? 0;
+    const zMin = state.pair.zEntryThreshold != null ? parseFloat(state.pair.zEntryThreshold) : 0;
+    const maxPos = state.pair.maxPositions != null ? parseInt(state.pair.maxPositions) : 1;
+    if (state.prevSignalSpread == null) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+    if (now - state.lastEntryAt < COOLDOWN_MS) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+    if (z < zMin) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+    const openCount = state.openPositions.filter((p) => p.status !== 'closed').length;
+    if (openCount >= maxPos) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+    const cap = state.pair.maxSpreadCap != null ? parseFloat(state.pair.maxSpreadCap) : Infinity;
+    if (signalSpread > cap) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+
+    if (state._entryInFlight) {
+      state.prevSignalSpread = signalSpread;
+      return;
+    }
+
+    for (let i = state.levels.length - 1; i >= 0; i--) {
+      const level = state.levels[i];
+      const already = state.openPositions.some((p) => p.status !== 'closed' && p.gridLevel === i + 1);
+      if (already) continue;
+      if (state.prevSignalSpread < level && signalSpread >= level) {
+        state._entryInFlight = true;
+        try {
+          await this._startEntry(state, i, signalSpread);
+        } finally {
+          state._entryInFlight = false;
+        }
+        break;
+      }
+    }
+    state.prevSignalSpread = signalSpread;
+  }
+}
+
+module.exports = new UnilateralExecutor();

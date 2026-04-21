@@ -1,0 +1,218 @@
+const { DataTypes } = require('sequelize');
+const sequelize = require('../config/database');
+
+const StatArbInput = sequelize.define('StatArbInput', {
+  id: {
+    type: DataTypes.INTEGER,
+    autoIncrement: true,
+    primaryKey: true,
+  },
+  exchange1: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  type1: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  symbol1: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  exchange2: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  type2: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  symbol2: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  agentName: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  tradeAccountA: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  qty1: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  tradeAccountB: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  qty2: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+  },
+  maxQty1: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  beta: {
+    type: DataTypes.DOUBLE,
+    defaultValue: null,
+    allowNull: true,
+  },
+  dailyLossLimitPct: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  dailyLossLimitUsd: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  dailyProfitLimitPct: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  zEntryThreshold: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  zEntryMax: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  maxPositions: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: 1,
+  },
+  maxLegAQty: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  maxLegBQty: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  maxNetQtyImbalance: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  profitTarget: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  profitFeeMultiplier: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: 10,
+  },
+  stopLoss: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  maxHoldMs: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: null,
+  },
+  spreadEntryLevels: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    defaultValue: null,
+  },
+  maxSpreadCap: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    defaultValue: null,
+  },
+  entryPollTimeoutMs: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: null,
+  },
+  tradingEnabled: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false,
+  },
+  // ── Per-session fields (reset on every enable) ──────────────────────
+  sessionStartedAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  sessionStoppedAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  sessionStartBalance: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Account balance when trading was enabled for this session',
+  },
+  sessionEndBalance: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Account balance fetched from exchange when trading was disabled',
+  },
+  sessionPnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'sessionEndBalance - sessionStartBalance',
+  },
+  // ── Lifetime fields (set once on first ever enable, never overwritten) ──
+  botStartBalance: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Account balance on the very first enable — never overwritten',
+  },
+  botStartedAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    comment: 'Timestamp of the very first enable',
+  },
+  botEndBalance: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'Account balance at the most recent disable — updated on every stop',
+  },
+  botPnl: {
+    type: DataTypes.DOUBLE,
+    allowNull: true,
+    comment: 'botEndBalance - botStartBalance (lifetime P&L)',
+  },
+  totalUptimeMs: {
+    type: DataTypes.BIGINT,
+    allowNull: true,
+    defaultValue: 0,
+    comment: 'Cumulative milliseconds the bot has been running',
+  },
+  lastStopReason: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    comment: 'Reason for the most recent disable: manual | daily_loss_limit | daily_profit_limit | qty_imbalance | leg_qty_limit | error | crash',
+  },
+  lastDisabledAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  status: {
+    type: DataTypes.ENUM('active', 'inactive'),
+    defaultValue: 'active',
+  },
+}, {
+  tableName: 'statarb_inputs',
+  timestamps: true,
+});
+
+module.exports = StatArbInput;

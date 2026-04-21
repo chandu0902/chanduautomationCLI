@@ -1,0 +1,48 @@
+require('dotenv').config();
+const buildApp = require('./app');
+const { sequelize, StatArbInput } = require('./models');
+const orderbookManager = require('./services/orderbookStreams');
+const tradeExecutor = require('./services/tradeExecutor');
+const unilateralExecutor = require('./services/unilateralExecutor');
+
+const PORT = process.env.PORT || 3001;
+
+const start = async () => {
+  const app = buildApp();
+
+  try {
+    // Test database connection
+    await sequelize.authenticate();
+    console.log('Database connected successfully.');
+
+    // Sync models (creates tables if they don't exist)
+    await sequelize.sync({ alter: true });
+    console.log('Database synced.');
+
+    // Start server
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    console.log(`Server running on http://localhost:${PORT}`);
+
+    // Auto-subscribe orderbook feeds and enable trading for active pairs on boot
+    const activePairs = await StatArbInput.findAll({ where: { status: 'active' } });
+    if (activePairs.length > 0) {
+      orderbookManager.syncWithActivePairs(activePairs);
+      console.log(`[Boot] Auto-subscribed ${activePairs.length} active pair(s) to orderbook feeds`);
+
+      // Auto-enable trading for all active pairs on boot.
+      // Trading stops only on manual disable or when pair status is set to inactive.
+      for (const pair of activePairs) {
+        const executor = pair.unilateralMode ? unilateralExecutor : tradeExecutor;
+        const result = await executor.enableTrading(pair.id);
+        // Keep DB flag in sync
+        await StatArbInput.update({ tradingEnabled: true }, { where: { id: pair.id } }).catch(() => {});
+        console.log(`[Boot] Auto-enabled trading pair ${pair.id} (${pair.agentName}): ${result.message || result.state}`);
+      }
+    }
+  } catch (err) {
+    console.error('Unable to start server:', err);
+    process.exit(1);
+  }
+};
+
+start();

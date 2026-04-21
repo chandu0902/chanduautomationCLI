@@ -1,0 +1,67 @@
+BTC BASIS BOT — CONFIGURATION
+Generated : 2026-03-26
+Strategy  : SHORT BASIS — sell BTC-24APR26 futures (maker limit) + buy BTC-PERPETUAL perp (taker market)
+Exchange  : Deribit (both legs)
+================================================================
+
+PAIR IDENTITY
+  symbol1      : BTC-24APR26
+  exchange1    : deribit
+  type1        : future
+
+  symbol2      : BTC-PERPETUAL
+  exchange2    : deribit
+  type2        : perpetual
+
+  agentName    : btc-basis-apr26
+  beta         : 1
+
+ACCOUNTS
+  tradeAccountA  : YOUR_FUTURES_ACCOUNT   ← replace with Deribit futures account name
+  tradeAccountB  : YOUR_PERP_ACCOUNT      ← replace with Deribit perp account name
+
+POSITION SIZING
+  qty1           : 300     (USD notional per futures fill — legA)
+  qty2           : 240     (USD notional per perp fill   — legB, 80% of qty1)
+
+EXIT TARGETS
+  profitTarget   : 0.12    ($0.12 gross profit to exit; floor is $0.103 = 2× round-trip fees)
+  stopLoss       : 0.065   ($0.065 gross loss stop = 1σ adverse spread move ≈ $21 widening)
+  Reward/risk    : 1.85:1  → need only 35% win rate to be profitable
+
+GRID ENTRY (implied carry rate % p.a.)
+  zEntryThreshold : 1.76   (grid floor  = mean+2σ = $121.6 dollar spread)
+  zEntryMax       : 2.37   (grid ceiling = mean+4σ = $163.8 dollar spread)
+  maxPositions    : 5      (5 levels evenly spaced between threshold and max)
+
+  Level 0 : 1.760%  →  $121.6 spread  →  P&L at mean reversion = $0.129
+  Level 1 : 1.915%  →  $132.1 spread  →  P&L at mean reversion = $0.162
+  Level 2 : 2.070%  →  $142.4 spread  →  P&L at mean reversion = $0.194
+  Level 3 : 2.225%  →  $152.9 spread  →  P&L at mean reversion = $0.226
+  Level 4 : 2.370%  →  $163.8 spread  →  P&L at mean reversion = $0.260
+
+RISK LIMITS
+  dailyLossLimitUsd : 1.00   (halt after $1.00 daily loss = ~3 full grids stopped)
+
+INITIAL STATE
+  tradingEnabled  : false   (enable via UI only after spread warms up)
+  status          : active
+
+================================================================
+WEEKLY RECALIBRATION — update zEntryThreshold and zEntryMax as DTE shrinks
+(same $121.8 and $163.8 dollar spread levels expressed in rate% at BTC $87,000)
+
+  DTE   zEntryThreshold   zEntryMax
+  29         1.76            2.37      ← current
+  21         2.44            3.28
+  14         3.65            4.92
+   7         7.30            9.83
+
+Stop the bot when DTE < 5 days.
+
+================================================================
+BEFORE ENABLING
+  1. Wait for spread std ≥ 0.20% p.a. on the chart (5000-tick window needs ~30 min to warm up)
+  2. Current rate must be BELOW 1.76% before starting (do not start into an already-triggered level)
+  3. Confirm isMeanReverting = true in logs (regime filter must not be blocking)
+================================================================

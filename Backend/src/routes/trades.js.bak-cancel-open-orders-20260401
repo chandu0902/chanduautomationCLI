@@ -1,0 +1,607 @@
+const crypto = require('crypto');
+const { Op } = require('sequelize');
+const tradeExecutor = require('../services/tradeExecutor');
+const unilateralExecutor = require('../services/unilateralExecutor');
+const Trade = require('../models/Trade');
+const { StatArbInput, BotSessionLog, BasisPosition, AccountDetails } = require('../models');
+const { signedRequest, buyorder, sellorder } = require('../controllers/apicontroller');
+
+function decryptCred(ak2, ak1, ak0) {
+  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ak2, 'base64'), Buffer.from(ak0, 'base64'));
+  return decipher.update(ak1, 'base64', 'utf8') + decipher.final('utf8');
+}
+
+async function tradeRoutes(fastify, options) {
+  const pickExecutor = (pairOrFlag) => {
+    const uni = typeof pairOrFlag === 'boolean' ? pairOrFlag : !!pairOrFlag?.unilateralMode;
+    return uni ? unilateralExecutor : tradeExecutor;
+  };
+
+  // Bot uptime
+  fastify.get('/api/bot/uptime', async (request, reply) => {
+    const { pairId } = request.query;
+    if (pairId) {
+      const pid = parseInt(pairId);
+      const state = tradeExecutor.pairs?.get(pid) || unilateralExecutor.pairs?.get(pid);
+      const enabledAt = state?.enabledAt ?? tradeExecutor.startedAt;
+      return { startedAt: enabledAt, uptimeMs: Date.now() - enabledAt };
+    }
+    return {
+      startedAt: tradeExecutor.startedAt,
+      uptimeMs: Date.now() - tradeExecutor.startedAt,
+    };
+  });
+
+  // Enable all pairs for an agent (bot)
+  fastify.post('/api/agents/:name/trade/enable', async (request, reply) => {
+    const { name } = request.params;
+    const pairs = await StatArbInput.findAll({ where: { agentName: name, status: 'active' } });
+    if (pairs.length === 0) {
+      return reply.status(400).send({ success: false, message: 'No active pairs for this agent' });
+    }
+    const results = [];
+    for (const pair of pairs) {
+      const result = await pickExecutor(pair).enableTrading(pair.id);
+      if (result.success) await StatArbInput.update({ tradingEnabled: true }, { where: { id: pair.id } });
+      results.push({ pairId: pair.id, ...result });
+    }
+    return { success: true, results };
+  });
+
+  // Disable (cancel) all pairs for an agent (bot)
+  fastify.post('/api/agents/:name/trade/disable', async (request, reply) => {
+    const { name } = request.params;
+    const pairs = await StatArbInput.findAll({ where: { agentName: name } });
+    const results = [];
+    for (const pair of pairs) {
+      const ex = pickExecutor(pair);
+      const state = ex.pairs.get(pair.id);
+      if (state && state.enabled) {
+        const result = await ex.disableTrading(pair.id);
+        if (result.success) await StatArbInput.update({ tradingEnabled: false }, { where: { id: pair.id } });
+        results.push({ pairId: pair.id, ...result });
+      }
+    }
+    return { success: true, cancelled: results.length, results };
+  });
+
+  // Get agent trading status
+  fastify.get('/api/agents/:name/trade/state', async (request, reply) => {
+    const { name } = request.params;
+    const pairs = await StatArbInput.findAll({ where: { agentName: name } });
+    const states = {};
+    for (const pair of pairs) {
+      states[pair.id] = pickExecutor(pair).getState(pair.id);
+    }
+    const enabledCount = Object.values(states).filter(s => s.enabled).length;
+    return { agentName: name, totalPairs: pairs.length, enabledCount, pairStates: states };
+  });
+
+  // Set profit target and stop loss for a pair
+  fastify.post('/api/pairs/:id/trade/config', async (request, reply) => {
+    const { id } = request.params;
+    const {
+      profitTarget,
+      stopLoss,
+      tpSpreadDelta,
+      slSpreadDelta,
+      maxLegAQty,
+      maxLegBQty,
+      maxNetQtyImbalance,
+      maxSpreadCap,
+      entryPollTimeoutMs,
+      zEntryThreshold,
+      zEntryMax
+    } = request.body || {};
+    const pair = await StatArbInput.findByPk(parseInt(id));
+    if (!pair) return reply.status(404).send({ success: false, message: 'Pair not found' });
+
+    const updates = {};
+    if (profitTarget       != null) updates.profitTarget       = parseFloat(profitTarget);
+    if (stopLoss           != null) updates.stopLoss           = parseFloat(stopLoss);
+    if (tpSpreadDelta      != null) updates.tpSpreadDelta      = parseFloat(tpSpreadDelta);
+    if (slSpreadDelta      != null) updates.slSpreadDelta      = parseFloat(slSpreadDelta);
+    if (maxLegAQty         != null) updates.maxLegAQty         = parseFloat(maxLegAQty);
+    if (maxLegBQty         != null) updates.maxLegBQty         = parseFloat(maxLegBQty);
+    if (maxNetQtyImbalance != null) updates.maxNetQtyImbalance = parseFloat(maxNetQtyImbalance);
+    if (maxSpreadCap          != null) updates.maxSpreadCap          = parseFloat(maxSpreadCap);
+    if (entryPollTimeoutMs    != null) updates.entryPollTimeoutMs    = parseInt(entryPollTimeoutMs);
+    if (zEntryThreshold       != null) updates.zEntryThreshold       = parseFloat(zEntryThreshold);
+    if (zEntryMax             != null) updates.zEntryMax             = parseFloat(zEntryMax);
+    if (Object.keys(updates).length === 0) return reply.status(400).send({ success: false, message: 'No valid fields provided' });
+
+    await pair.update(updates);
+
+    // Hot-reload into running state if trading is active
+    const ex = pickExecutor(pair);
+    const tradeState = ex.pairs.get(parseInt(id));
+    if (tradeState) {
+      if (updates.profitTarget       != null) tradeState.profitTarget       = updates.profitTarget;
+      if (updates.stopLoss           != null) tradeState.stopLoss           = updates.stopLoss;
+      if (updates.tpSpreadDelta      != null) tradeState.tpSpreadDelta      = updates.tpSpreadDelta;
+      if (updates.slSpreadDelta      != null) tradeState.slSpreadDelta      = updates.slSpreadDelta;
+      if (updates.maxLegAQty         != null) { tradeState.maxLegAQty         = updates.maxLegAQty;         tradeState._qtyLimitTriggered = false; }
+      if (updates.maxLegBQty         != null) { tradeState.maxLegBQty         = updates.maxLegBQty;         tradeState._qtyLimitTriggered = false; }
+      if (updates.maxNetQtyImbalance != null) { tradeState.maxNetQtyImbalance = updates.maxNetQtyImbalance; tradeState._qtyLimitTriggered = false; }
+      if (updates.maxSpreadCap          != null) tradeState.maxSpreadCap          = updates.maxSpreadCap;
+      if (updates.entryPollTimeoutMs    != null) tradeState.entryPollTimeoutMs    = updates.entryPollTimeoutMs;
+      if (updates.zEntryThreshold       != null) tradeState.zEntryThreshold       = updates.zEntryThreshold;
+      if (updates.zEntryMax             != null) tradeState.zEntryMax             = updates.zEntryMax;
+    }
+
+    return { success: true, pairId: id, ...updates };
+  });
+
+  // Enable auto-trading for a pair
+  fastify.post('/api/pairs/:id/trade/enable', async (request, reply) => {
+    const { id } = request.params;
+    const pair = await StatArbInput.findByPk(parseInt(id));
+    if (!pair) return reply.status(404).send({ success: false, message: 'Pair not found' });
+    const result = await pickExecutor(pair).enableTrading(parseInt(id));
+    if (!result.success) {
+      return reply.status(400).send(result);
+    }
+    await StatArbInput.update({ tradingEnabled: true }, { where: { id: parseInt(id) } });
+    return result;
+  });
+
+  // Disable auto-trading for a pair
+  fastify.post('/api/pairs/:id/trade/disable', async (request, reply) => {
+    const { id } = request.params;
+    const pair = await StatArbInput.findByPk(parseInt(id));
+    if (!pair) return reply.status(404).send({ success: false, message: 'Pair not found' });
+    const result = await pickExecutor(pair).disableTrading(parseInt(id));
+    if (!result.success) {
+      return reply.status(400).send(result);
+    }
+    await StatArbInput.update({ tradingEnabled: false, status: 'inactive' }, { where: { id: parseInt(id) } });
+    return result;
+  });
+
+  // Get current trade state for a pair
+  fastify.get('/api/pairs/:id/trade/state', async (request, reply) => {
+    const { id } = request.params;
+    const pair = await StatArbInput.findByPk(parseInt(id));
+    if (!pair) return reply.status(404).send({ success: false, message: 'Pair not found' });
+    return pickExecutor(pair).getState(parseInt(id));
+  });
+
+  // Live exchange positions for a pair (Deribit only)
+  fastify.get('/api/pairs/:id/exchange-positions', async (request, reply) => {
+    const pairId = parseInt(request.params.id);
+    const pair = await StatArbInput.findByPk(pairId);
+    if (!pair) return reply.status(404).send({ error: 'Pair not found' });
+
+    // Load credentials for both accounts
+    const accounts = await AccountDetails.findAll({
+      where: { Trade_Account: [pair.tradeAccountA, pair.tradeAccountB].filter(Boolean) }
+    });
+
+    const results = {};
+    for (const acc of accounts) {
+      if (!acc.Api_Key || !acc.Secret_Key) continue;
+      try {
+        const [ak0, ak1, ak2] = acc.Api_Key.split(',', 3);
+        const [sk0, sk1, sk2] = acc.Secret_Key.split(',', 3);
+        const apiKey = decryptCred(ak2, ak1, ak0);
+        const secretKey = decryptCred(sk2, sk1, sk0);
+
+        const posResp = await signedRequest(
+          '/api/v2/private/get_positions?currency=BTC&kind=future',
+          apiKey, secretKey
+        );
+        results[acc.Trade_Account] = posResp?.result ?? posResp;
+      } catch (err) {
+        results[acc.Trade_Account] = { error: err.message };
+      }
+    }
+
+    return results;
+  });
+
+  // Close a specific exchange position by placing a market order in the opposite direction (Deribit only)
+  fastify.post('/api/pairs/:id/close-exchange-position', async (request, reply) => {
+    const pairId = parseInt(request.params.id);
+    const { instrument, qty, account } = request.body || {};
+    if (!instrument || !qty) return reply.status(400).send({ error: 'instrument and qty required' });
+
+    const pair = await StatArbInput.findByPk(pairId);
+    if (!pair) return reply.status(404).send({ error: 'Pair not found' });
+
+    const accountName = account || pair.tradeAccountA;
+    const accounts = await AccountDetails.findAll({ where: { Trade_Account: accountName } });
+    if (!accounts.length) return reply.status(404).send({ error: `Account not found: ${accountName}` });
+
+    const acc = accounts[0];
+    const [ak0, ak1, ak2] = acc.Api_Key.split(',', 3);
+    const [sk0, sk1, sk2] = acc.Secret_Key.split(',', 3);
+    const apiKey = decryptCred(ak2, ak1, ak0);
+    const secretKey = decryptCred(sk2, sk1, sk0);
+
+    // Fetch current position to determine side
+    const posResp = await signedRequest(
+      `/api/v2/private/get_positions?currency=BTC&kind=future`,
+      apiKey, secretKey
+    );
+    const positions = posResp?.result ?? [];
+    const pos = Array.isArray(positions) ? positions.find(p => p.instrument_name === instrument) : null;
+    const currentSize = pos?.size ?? 0;
+
+    if (currentSize === 0) return { message: 'No open position', instrument, size: 0 };
+
+    // To close: if short (size < 0) → BUY; if long (size > 0) → SELL
+    const closeQty = Math.abs(qty);
+    let orderResp;
+    if (currentSize < 0) {
+      // Close short: BUY at market
+      orderResp = await buyorder(instrument, closeQty, 'market', null, apiKey, secretKey);
+    } else {
+      // Close long: SELL at market
+      orderResp = await sellorder(instrument, closeQty, 'market', null, apiKey, secretKey);
+    }
+
+    return { instrument, currentSize, closeQty, side: currentSize < 0 ? 'buy' : 'sell', response: orderResp };
+  });
+
+  // Session history for a pair — uptime, downtime, stop reasons
+  fastify.get('/api/pairs/:id/sessions', async (request, reply) => {
+    const pairId = parseInt(request.params.id);
+    const limit  = Math.min(parseInt(request.query.limit ?? 50), 200);
+    const sessions = await BotSessionLog.findAll({
+      where: { pairId },
+      order: [['id', 'DESC']],
+      limit,
+    });
+    return sessions;
+  });
+
+  // Roundtrips — BasisPosition records with entry→exit mapping
+  fastify.get('/api/trades/roundtrips', async (request, reply) => {
+    const { pairId, pairIds: pairIdsRaw, agentName } = request.query;
+    const where = {};
+    if (pairId) where.pairId = parseInt(pairId);
+    if (pairIdsRaw && !pairId) {
+      const ids = pairIdsRaw.split(',').map(Number).filter(Boolean);
+      if (ids.length > 0) where.pairId = ids;
+      else return [];
+    }
+    if (agentName) {
+      const agentPairs = await StatArbInput.findAll({ where: { agentName }, attributes: ['id'] });
+      const ids = agentPairs.map(p => p.id);
+      if (ids.length > 0) where.pairId = ids;
+      else return [];
+    }
+    // Show positions with a confirmed entry, including unilateral signal mode.
+    where.state = { [Op.in]: ['open', 'pending_exit', 'closed'] };
+    where.legA_entryPrice = { [Op.ne]: null };
+
+    const positions = await BasisPosition.findAll({
+      where,
+      order: [['id', 'DESC']],
+      limit: 500,
+    });
+
+    const tradeIds = [];
+    for (const p of positions) {
+      if (p.entryTradeId) tradeIds.push(p.entryTradeId);
+      if (p.exitTradeId) tradeIds.push(p.exitTradeId);
+    }
+    const uniqTradeIds = [...new Set(tradeIds)];
+    const trades = uniqTradeIds.length > 0
+      ? await Trade.findAll({ where: { id: { [Op.in]: uniqTradeIds } } })
+      : [];
+    const tradeMap = new Map(trades.map(t => [t.id, t]));
+
+    return positions.map((p) => {
+      const row = p.toJSON();
+      const entryTrade = row.entryTradeId ? tradeMap.get(row.entryTradeId) : null;
+      const exitTrade = row.exitTradeId ? tradeMap.get(row.exitTradeId) : null;
+
+      const fallbackGross =
+        (exitTrade?.pnl ?? null) ??
+        ((
+          (entryTrade?.legA_pnl ?? 0) + (entryTrade?.legB_pnl ?? 0) +
+          (exitTrade?.legA_pnl ?? 0) + (exitTrade?.legB_pnl ?? 0)
+        ) || null);
+      const fallbackCommission =
+        ((entryTrade?.commission ?? 0) + (exitTrade?.commission ?? 0)) || null;
+      const fallbackTakerFee =
+        ((entryTrade?.takerFeeUsd ?? 0) + (exitTrade?.takerFeeUsd ?? 0)) || null;
+      const grossPnl = row.grossPnl ?? fallbackGross;
+      const commission = row.commission ?? fallbackCommission;
+      const takerFeeUsd = row.takerFeeUsd ?? fallbackTakerFee;
+      const netPnl = row.netPnl ?? (grossPnl != null ? (grossPnl + (commission ?? 0) - (takerFeeUsd ?? 0)) : null);
+
+      const entryTime = row.entryTime ?? entryTrade?.createdAt ?? null;
+      const exitTime = row.exitTime ?? exitTrade?.createdAt ?? null;
+      const holdMs = row.holdMs ?? ((entryTime && exitTime) ? (new Date(exitTime).getTime() - new Date(entryTime).getTime()) : null);
+
+      return {
+        ...row,
+        entrySpread: row.entrySpread ?? entryTrade?.spreadAtEntry ?? null,
+        entrySignalSpread: row.entrySpread ?? entryTrade?.spreadAtEntry ?? null,
+        entryFillSpread: ((
+          (row.legA_entryPrice ?? entryTrade?.legA_price) != null &&
+          (row.legB_entryPrice ?? entryTrade?.legB_price) != null
+        ) ? parseFloat(((row.legA_entryPrice ?? entryTrade?.legA_price) - (row.legB_entryPrice ?? entryTrade?.legB_price)).toFixed(4)) : null),
+        exitSpread: row.exitSpread ?? exitTrade?.spreadAtExit ?? null,
+        legA_entryPrice: row.legA_entryPrice ?? entryTrade?.legA_price ?? null,
+        legB_entryPrice: row.legB_entryPrice ?? entryTrade?.legB_price ?? null,
+        legA_exitPrice: row.legA_exitPrice ?? exitTrade?.legA_price ?? null,
+        legB_exitPrice: row.legB_exitPrice ?? exitTrade?.legB_price ?? null,
+        grossPnl,
+        commission,
+        takerFeeUsd,
+        netPnl,
+        entryTime,
+        exitTime,
+        holdMs,
+        entrySpreadSlippage: ((
+          (row.entrySpread ?? entryTrade?.spreadAtEntry) != null &&
+          ((row.legA_entryPrice ?? entryTrade?.legA_price) != null && (row.legB_entryPrice ?? entryTrade?.legB_price) != null)
+        ) ? parseFloat((((row.legA_entryPrice ?? entryTrade?.legA_price) - (row.legB_entryPrice ?? entryTrade?.legB_price)) - (row.entrySpread ?? entryTrade?.spreadAtEntry)).toFixed(4)) : null),
+        entryTradeStatus: entryTrade?.status ?? null,
+        exitTradeStatus: exitTrade?.status ?? null,
+      };
+    });
+  });
+
+  // Get all trade logs — filterable by agent
+  fastify.get('/api/trades', async (request, reply) => {
+    const { pairId, pairIds: pairIdsRaw, status, agentName } = request.query;
+    const where = {};
+    if (pairId) where.pairId = parseInt(pairId);
+    if (status) where.status = status;
+
+    if (pairIdsRaw && !pairId) {
+      const ids = pairIdsRaw.split(',').map(Number).filter(Boolean);
+      if (ids.length > 0) where.pairId = ids;
+      else return [];
+    }
+
+    if (agentName) {
+      const agentPairs = await StatArbInput.findAll({ where: { agentName }, attributes: ['id'] });
+      const ids = agentPairs.map(p => p.id);
+      if (ids.length > 0) {
+        where.pairId = ids;
+      } else {
+        return [];
+      }
+    }
+
+    const trades = await Trade.findAll({ where, order: [['createdAt', 'DESC']] });
+    return trades;
+  });
+
+  // Get trade analytics summary — symbol-wise, filterable by agent
+  fastify.get('/api/trades/analytics', async (request, reply) => {
+    const { pairId, pairIds: pairIdsRaw, agentName } = request.query;
+    const where = {};
+    const emptyResult = { totalTrades: 0, filledCount: 0, cancelledCount: 0, otherCount: 0, totalExecutions: 0, totalRoundtrips: 0, totalBuys: 0, totalSells: 0, totalVolume: 0, totalPnl: 0, totalFeesLegA: 0, totalFeesLegB: 0, totalFees: 0, netPnlAfterFees: 0, perSymbol: {} };
+    if (pairId) where.pairId = parseInt(pairId);
+
+    if (pairIdsRaw && !pairId) {
+      const ids = pairIdsRaw.split(',').map(Number).filter(Boolean);
+      if (ids.length > 0) where.pairId = ids;
+      else return emptyResult;
+    }
+
+    if (agentName) {
+      const agentPairs = await StatArbInput.findAll({ where: { agentName }, attributes: ['id'] });
+      const ids = agentPairs.map(p => p.id);
+      if (ids.length > 0) {
+        where.pairId = ids;
+      } else {
+        return emptyResult;
+      }
+    }
+
+    const trades = await Trade.findAll({ where, order: [['createdAt', 'ASC']] });
+
+    // Count by status
+    const totalTrades = trades.length;
+    let filledCount = 0, cancelledCount = 0, otherCount = 0;
+    for (const t of trades) {
+      if (t.status === 'filled') filledCount++;
+      else if (t.status === 'cancelled') cancelledCount++;
+      else otherCount++;
+    }
+
+    // Only use filled trades for analytics
+    const filledTrades = trades.filter(t => t.status === 'filled');
+
+    // Fee rates per exchange (maker / taker)
+    // Deribit: maker = -0.0001015 (rebate, negative = credit), taker = 0.0002339
+    const FEE_RATES = {
+      hyperliquid: { maker: 0.00015,    taker: 0.00045  },
+      deribit:     { maker: -0.0001015, taker: 0.0002339 },
+    };
+    const getFeeRate = (exchange, fillType) => {
+      const ex = (exchange || '').toLowerCase();
+      const rates = FEE_RATES[ex] || { maker: 0.0002, taker: 0.0005 };
+      return fillType === 'taker' ? rates.taker : rates.maker;
+    };
+
+    // Correct USD notional:
+    //   Deribit inverse: qty is already USD notional (API amount = USD)
+    //   Hyperliquid linear: price × qty
+    const notionalUsd = (exchange, price, qty) =>
+      (exchange || '').toLowerCase() === 'deribit'
+        ? qty
+        : price * qty;
+
+    // Total executions = filled legA orders; count legB only when qty > 0.
+    let totalExecutions = 0;
+    for (const t of filledTrades) {
+      if (t.legA_filledAt) totalExecutions++;
+      if (t.legB_filledAt && (t.legB_qty || 0) > 0) totalExecutions++;
+    }
+
+    // totalFeesLegA = total maker rebate received (positive = income, adds to net P&L)
+    // totalFeesLegB = total taker fee paid (positive = cost, subtracts from net P&L)
+    let totalFeesLegA = 0, totalFeesLegB = 0;
+    for (const t of filledTrades) {
+      // Use actual commission when saved; otherwise estimate from notional
+      if (t.commission != null) {
+        totalFeesLegA += t.commission; // maker rebate (positive = income)
+      } else if (t.legA_price != null && t.legA_qty != null && t.legA_filledAt) {
+        const rate = getFeeRate(t.legA_exchange, t.legA_fillType);
+        totalFeesLegA += Math.abs(notionalUsd(t.legA_exchange, t.legA_price, t.legA_qty) * rate);
+      }
+      // Taker fee: use actual takerFeeUsd; fall back to legacy 2-leg notional estimate
+      if (t.takerFeeUsd != null) {
+        totalFeesLegB += t.takerFeeUsd; // taker fee (positive = cost)
+      } else if (t.legB_price != null && t.legB_qty != null && (t.legB_qty || 0) > 0 && t.legB_filledAt && t.legB_symbol) {
+        totalFeesLegB += notionalUsd(t.legB_exchange, t.legB_price, t.legB_qty) * getFeeRate(t.legB_exchange, 'taker');
+      }
+    }
+
+    // Collect all fills into a per-symbol map
+    const symbols = {}; // symbol -> { buys:[], sells:[], buyVwaps:[], sellVwaps:[], pnl:0 }
+
+    const ensureSymbol = (sym, feeRate) => {
+      if (!symbols[sym]) {
+        symbols[sym] = { buys: 0, sells: 0, buyVolume: 0, sellVolume: 0, buyVwaps: [], sellVwaps: [], pnl: 0, buyFills: [], sellFills: [], fees: 0, feeRate: feeRate || 0.00015 };
+      }
+      return symbols[sym];
+    };
+
+    for (const t of filledTrades) {
+      // Process leg A
+      if (t.legA_symbol && t.legA_filledAt) {
+        const s = ensureSymbol(t.legA_symbol, getFeeRate(t.legA_exchange, t.legA_fillType));
+        if (t.legA_side === 'buy') {
+          s.buys++;
+          if (t.legA_price != null && t.legA_qty != null) {
+            const vol = notionalUsd(t.legA_exchange, t.legA_price, t.legA_qty);
+            s.buyVolume += vol;
+            s.buyFills.push({ price: t.legA_price, qty: t.legA_qty });
+          }
+        } else if (t.legA_side === 'sell') {
+          s.sells++;
+          if (t.legA_price != null && t.legA_qty != null) {
+            const vol = notionalUsd(t.legA_exchange, t.legA_price, t.legA_qty);
+            s.sellVolume += vol;
+            s.sellFills.push({ price: t.legA_price, qty: t.legA_qty });
+          }
+        }
+        // Maker rebate reduces net fee cost (income)
+        if (t.commission != null) {
+          s.fees -= t.commission; // subtract rebate from cost (commission is positive income)
+        } else if (t.legA_price != null && t.legA_qty != null) {
+          s.fees -= Math.abs(notionalUsd(t.legA_exchange, t.legA_price, t.legA_qty) * getFeeRate(t.legA_exchange, t.legA_fillType));
+        }
+        if (t.legA_side === 'buy'  && t.legA_buyVwap  != null) s.buyVwaps.push(t.legA_buyVwap);
+        if (t.legA_side === 'sell' && t.legA_sellVwap != null) s.sellVwaps.push(t.legA_sellVwap);
+        if (t.legA_pnl != null) s.pnl += t.legA_pnl; // gross PnL
+      }
+
+      // Process leg B — only for legacy 2-leg trades (legB_symbol present)
+      if (t.legB_symbol && t.legB_filledAt && (t.legB_qty || 0) > 0) {
+        const s = ensureSymbol(t.legB_symbol, getFeeRate(t.legB_exchange, t.legB_fillType));
+        if (t.legB_side === 'buy') {
+          s.buys++;
+          if (t.legB_price != null && t.legB_qty != null) {
+            s.buyVolume += notionalUsd(t.legB_exchange, t.legB_price, t.legB_qty);
+            s.buyFills.push({ price: t.legB_price, qty: t.legB_qty });
+          }
+        } else if (t.legB_side === 'sell') {
+          s.sells++;
+          if (t.legB_price != null && t.legB_qty != null) {
+            s.sellVolume += notionalUsd(t.legB_exchange, t.legB_price, t.legB_qty);
+            s.sellFills.push({ price: t.legB_price, qty: t.legB_qty });
+          }
+        }
+        if (t.takerFeeUsd != null) {
+          s.fees += t.takerFeeUsd; // actual taker fee for this trade's legB
+        } else if (t.legB_price != null && t.legB_qty != null) {
+          s.fees += notionalUsd(t.legB_exchange, t.legB_price, t.legB_qty) * getFeeRate(t.legB_exchange, 'taker');
+        }
+        if (t.legB_side === 'buy'  && t.legB_buyVwap  != null) s.buyVwaps.push(t.legB_buyVwap);
+        if (t.legB_side === 'sell' && t.legB_sellVwap != null) s.sellVwaps.push(t.legB_sellVwap);
+        if (t.legB_pnl != null) s.pnl += t.legB_pnl;
+      }
+    }
+
+    // Pair-level roundtrips: use closed BasisPosition records for exact entry→exit matching.
+    const roundtripWhere = { ...where, state: 'closed' };
+    const closedPositions = await BasisPosition.findAll({
+      where: roundtripWhere,
+      attributes: ['grossPnl', 'commission', 'takerFeeUsd', 'netPnl'],
+      limit: 5000,
+    });
+    const totalRoundtrips = closedPositions.length;
+    const totalRoundtripGrossPnl = parseFloat(closedPositions.reduce((s, p) => s + Number(p.grossPnl || 0), 0).toFixed(6));
+    const totalRoundtripCommission = parseFloat(closedPositions.reduce((s, p) => s + Number(p.commission || 0), 0).toFixed(6));
+    const totalRoundtripTakerFees = parseFloat(closedPositions.reduce((s, p) => s + Number(p.takerFeeUsd || 0), 0).toFixed(6));
+    const totalRoundtripNetPnl = parseFloat(closedPositions.reduce((s, p) => s + Number(p.netPnl || 0), 0).toFixed(6));
+
+    // Build per-symbol analytics
+    let totalVolume = 0, totalPnl = 0;
+    const perSymbol = {};
+
+    for (const [sym, d] of Object.entries(symbols)) {
+      const roundtrips = Math.min(d.buys, d.sells);
+      const volume = d.buyVolume + d.sellVolume;
+      const avgBuyVwap = d.buyVwaps.length > 0 ? d.buyVwaps.reduce((a, b) => a + b, 0) / d.buyVwaps.length : null;
+      const avgSellVwap = d.sellVwaps.length > 0 ? d.sellVwaps.reduce((a, b) => a + b, 0) / d.sellVwaps.length : null;
+
+      perSymbol[sym] = {
+        buys: d.buys,
+        sells: d.sells,
+        roundtrips,
+        buyVolume: parseFloat(d.buyVolume.toFixed(4)),
+        sellVolume: parseFloat(d.sellVolume.toFixed(4)),
+        volume: parseFloat(volume.toFixed(4)),
+        avgBuyVwap: avgBuyVwap != null ? parseFloat(avgBuyVwap.toFixed(4)) : null,
+        avgSellVwap: avgSellVwap != null ? parseFloat(avgSellVwap.toFixed(4)) : null,
+        pnl: parseFloat(d.pnl.toFixed(6)),
+        fees: parseFloat(d.fees.toFixed(6)),
+        netPnl: parseFloat((d.pnl - d.fees).toFixed(6)),
+      };
+
+      totalVolume += volume;
+      totalPnl += d.pnl;
+    }
+
+    // Aggregate buys/sells at trade level (not per-symbol to avoid double-counting)
+    const totalBuys = filledTrades.filter(t => t.side === 'entry' && t.legA_side === 'buy').length
+                    + filledTrades.filter(t => t.side === 'exit' && t.legA_side === 'buy').length;
+    const totalSells = filledTrades.filter(t => t.side === 'entry' && t.legA_side === 'sell').length
+                     + filledTrades.filter(t => t.side === 'exit' && t.legA_side === 'sell').length;
+
+    // Exchange-reported PnL from actual balance changes (includes fees + funding)
+    let totalExchangePnl = null;
+    const exitTrades = filledTrades.filter(t => t.side === 'exit' && t.exchangePnl != null);
+    if (exitTrades.length > 0) {
+      totalExchangePnl = parseFloat(exitTrades.reduce((sum, t) => sum + parseFloat(t.exchangePnl), 0).toFixed(6));
+    }
+
+    // totalFees = net fee cost = taker fees - maker rebates (positive = net cost)
+    const totalFees = parseFloat((totalFeesLegB - totalFeesLegA).toFixed(6));
+    return {
+      totalTrades,
+      filledCount,
+      cancelledCount,
+      otherCount,
+      totalExecutions,
+      totalRoundtrips,
+      totalRoundtripGrossPnl,
+      totalRoundtripCommission,
+      totalRoundtripTakerFees,
+      totalRoundtripNetPnl,
+      totalBuys,
+      totalSells,
+      totalVolume: parseFloat(totalVolume.toFixed(4)),
+      totalPnl: parseFloat(totalPnl.toFixed(6)),
+      totalFeesLegA: parseFloat(totalFeesLegA.toFixed(6)),
+      totalFeesLegB: parseFloat(totalFeesLegB.toFixed(6)),
+      totalFees,
+      netPnlAfterFees: parseFloat((totalPnl + totalFeesLegA - totalFeesLegB).toFixed(6)),
+      totalExchangePnl,
+      perSymbol,
+    };
+  });
+}
+
+module.exports = tradeRoutes;

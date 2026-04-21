@@ -1,0 +1,609 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { api } from "@/lib/api";
+
+function StatCard({ label, value, sub, color = "slate" }) {
+  const colorMap = {
+    emerald: "text-emerald-400",
+    red: "text-red-400",
+    blue: "text-blue-400",
+    violet: "text-violet-400",
+    amber: "text-amber-400",
+    orange: "text-orange-400",
+    cyan: "text-cyan-400",
+    slate: "text-white",
+  };
+  return (
+    <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-5">
+      <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-1">{label}</p>
+      <p className={`text-2xl font-bold font-mono ${colorMap[color] || colorMap.slate}`}>{value}</p>
+      {sub && <p className="text-xs text-slate-500 mt-1">{sub}</p>}
+    </div>
+  );
+}
+
+
+function formatUptime(ms) {
+  if (!ms || ms < 0) return "0s";
+  const seconds = Math.floor(ms / 1000);
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const parts = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return parts.join(" ");
+}
+
+export default function TradeLogsPage({ pairs = [] }) {
+  const [trades, setTrades] = useState([]);
+  const [analytics, setAnalytics] = useState(null);
+  const [roundtrips, setRoundtrips] = useState([]);
+  const [uptime, setUptime] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [filterPairId, setFilterPairId] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterAgent, setFilterAgent] = useState("");
+  const [botTab, setBotTab] = useState("active"); // "active" | "inactive"
+  const [viewTab, setViewTab] = useState("trades"); // "trades" | "roundtrips"
+
+  // All agent names from ALL pairs (always, regardless of tab)
+  const agents = [...new Set(pairs.filter(p => p.agentName).map(p => p.agentName))].sort();
+
+  // Filter pairs by active/inactive tab
+  const tabFilteredPairs = pairs.filter(p => botTab === "active" ? p.status === "active" : p.status !== "active");
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const tabPairIds = pairs.filter(p => botTab === "active" ? p.status === "active" : p.status !== "active").map(p => p.id);
+
+      const params = new URLSearchParams();
+      if (filterAgent) params.set("agentName", filterAgent);
+      else if (filterPairId) params.set("pairId", filterPairId);
+      else if (tabPairIds.length > 0) params.set("pairIds", tabPairIds.join(","));
+      if (filterStatus) params.set("status", filterStatus);
+      const qs = params.toString() ? `?${params.toString()}` : "";
+
+      const analyticsParams = new URLSearchParams();
+      if (filterAgent) analyticsParams.set("agentName", filterAgent);
+      else if (filterPairId) analyticsParams.set("pairId", filterPairId);
+      else if (tabPairIds.length > 0) analyticsParams.set("pairIds", tabPairIds.join(","));
+      const analyticsQs = analyticsParams.toString() ? `?${analyticsParams.toString()}` : "";
+
+      const [tradesData, analyticsData, uptimeData, roundtripsData] = await Promise.all([
+        api.get(`/api/trades${qs}`),
+        api.get(`/api/trades/analytics${analyticsQs}`),
+        api.get(`/api/bot/uptime${filterPairId ? `?pairId=${filterPairId}` : ''}`).catch(() => null),
+        api.get(`/api/trades/roundtrips${analyticsQs}`).catch(() => []),
+      ]);
+      setTrades(tradesData);
+      setAnalytics(analyticsData);
+      setUptime(uptimeData);
+      setRoundtrips(Array.isArray(roundtripsData) ? roundtripsData : []);
+    } catch (err) {
+      console.error("Failed to fetch trade data:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, [filterAgent, filterPairId, filterStatus, botTab, pairs]);
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 5000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
+
+  const formatDate = (d) => {
+    if (!d) return "-";
+    const dt = new Date(d);
+    return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) +
+      " " +
+      dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  };
+
+  const formatPrice = (v) => (v != null ? Number(v).toFixed(4) : "-");
+
+
+  const formatPnl = (v) => {
+    if (v == null) return "-";
+    const n = Number(v);
+    return n >= 0 ? `+${n.toFixed(4)}` : n.toFixed(4);
+  };
+
+  const statusBadge = (status) => {
+    const map = {
+      open: "bg-blue-500/15 text-blue-400 border-blue-500/20",
+      closed: "bg-emerald-500/15 text-emerald-400 border-emerald-500/20",
+      cancelled: "bg-orange-500/15 text-orange-400 border-orange-500/20",
+      filled: "bg-cyan-500/15 text-cyan-400 border-cyan-500/20",
+    };
+    return (
+      <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${map[status] || map.open}`}>
+        {status}
+      </span>
+    );
+  };
+
+  const sideBadge = (side) => {
+    return (
+      <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+        side === "entry"
+          ? "bg-violet-500/15 text-violet-400 border-violet-500/20"
+          : "bg-amber-500/15 text-amber-400 border-amber-500/20"
+      }`}>
+        {side}
+      </span>
+    );
+  };
+
+  const pairMap = {};
+  const pairById = {};
+  for (const p of pairs) {
+    pairMap[p.id] = `${p.symbol1} / ${p.symbol2}`;
+    pairById[p.id] = p;
+  }
+
+  const thClass = "text-left px-3 py-3 text-[10px] font-bold uppercase tracking-widest text-slate-600 whitespace-nowrap";
+  const tdClass = "px-3 py-3";
+
+  return (
+    <>
+      {/* Bot Status Tabs */}
+      <div className="flex items-center gap-2 mb-6">
+        {[
+          { key: "active", label: "Active", count: pairs.filter(p => p.status === "active").length },
+          { key: "inactive", label: "Inactive", count: pairs.filter(p => p.status !== "active").length },
+        ].map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => { setBotTab(tab.key); setFilterPairId(""); setFilterAgent(""); }}
+            className={`px-4 py-2 rounded-xl text-sm font-semibold border transition-all cursor-pointer flex items-center gap-2 ${
+              botTab === tab.key
+                ? tab.key === "active"
+                  ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-400"
+                  : "bg-slate-700/60 border-slate-600/60 text-slate-300"
+                : "bg-slate-900/60 border-slate-800/60 text-slate-500 hover:text-slate-300"
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-full inline-block ${tab.key === "active" ? "bg-emerald-400" : "bg-slate-500"}`} />
+            {tab.label}
+            <span className="text-xs font-mono opacity-70">({tab.count})</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Header with Uptime */}
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h2 className="text-xl font-bold text-white">Trade Logs & Analytics</h2>
+          <p className="text-sm text-slate-500">
+            {botTab === "active" ? "Active bots only" : "Inactive bots only"}
+          </p>
+        </div>
+        <div className="flex items-center gap-4">
+          {uptime && (
+            <div className="flex items-center gap-2 px-4 py-2 rounded-xl border border-slate-800/60 bg-slate-900/80">
+              <span className="glow-dot w-2 h-2 rounded-full bg-emerald-400" />
+              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Uptime</span>
+              <span className="text-sm font-mono text-emerald-400">{formatUptime(uptime.uptimeMs)}</span>
+            </div>
+          )}
+          <button
+            onClick={fetchData}
+            className="px-4 py-2 rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-300 text-sm font-medium hover:bg-slate-700/40 transition-all cursor-pointer"
+          >
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {/* Summary Row */}
+      {analytics && (
+        <>
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4 mb-4">
+          <StatCard label="Total Trades" value={analytics.totalTrades} color="slate" />
+          <StatCard label="Filled" value={analytics.filledCount} color="emerald" />
+          <StatCard label="Cancelled" value={analytics.cancelledCount} color="amber" />
+          <StatCard label="Other" value={analytics.otherCount} color="orange" />
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4 mb-4">
+          <StatCard label="Total Executions" value={analytics.totalExecutions} sub="filled legs" color="slate" />
+          <StatCard label="Roundtrips" value={analytics.totalRoundtrips} color="violet" />
+          <StatCard label="Total Buys" value={analytics.totalBuys} color="emerald" />
+          <StatCard label="Total Sells" value={analytics.totalSells} color="red" />
+          <StatCard label="Total Volume" value={analytics.totalVolume?.toFixed(2)} color="blue" />
+          <StatCard label="Gross P&L" value={formatPnl(analytics.totalPnl)} sub="before fees" color={analytics.totalPnl >= 0 ? "emerald" : "red"} />
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+          <StatCard label="Maker Rebate" value={analytics.totalFeesLegA != null ? `+$${analytics.totalFeesLegA.toFixed(4)}` : "-"} sub="income (+adds to P&L)" color="emerald" />
+          <StatCard label="Taker Fees" value={analytics.totalFeesLegB != null ? `-$${analytics.totalFeesLegB.toFixed(4)}` : "-"} sub="cost (-subtracts from P&L)" color="red" />
+          <StatCard label="Net Fee Cost" value={analytics.totalFees != null ? (analytics.totalFees >= 0 ? `$${analytics.totalFees.toFixed(4)}` : `-$${Math.abs(analytics.totalFees).toFixed(4)}`) : "-"} sub="taker - maker" color={analytics.totalFees <= 0 ? "emerald" : "red"} />
+          <StatCard label="Net P&L" value={analytics.netPnlAfterFees != null ? formatPnl(analytics.netPnlAfterFees) : "-"} sub="after fees" color={analytics.netPnlAfterFees >= 0 ? "emerald" : "red"} />
+        </div>
+        </>
+      )}
+
+      {/* Per-Symbol Analytics */}
+      {analytics && analytics.perSymbol && Object.keys(analytics.perSymbol).length > 0 && (
+        <div className="space-y-4 mb-6">
+          {Object.entries(analytics.perSymbol).map(([sym, d]) => (
+            <div key={sym} className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] p-5">
+              <div className="flex items-center gap-2 mb-4 pb-3 border-b border-slate-800/50">
+                <div className="w-2 h-2 rounded-full bg-blue-400" />
+                <span className="text-sm font-bold text-white font-mono">{sym}</span>
+                <div className="ml-auto flex items-center gap-4">
+                  <span className={`text-xs font-mono ${d.fees != null && d.fees < 0 ? "text-emerald-400" : "text-amber-400"}`}>
+                    Fees: {d.fees != null ? (d.fees < 0 ? `+$${Math.abs(d.fees).toFixed(4)}` : `$${d.fees.toFixed(4)}`) : "-"}
+                  </span>
+                  <span className={`text-sm font-bold font-mono ${d.pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                    Gross: {formatPnl(d.pnl)}
+                  </span>
+                  <span className={`text-sm font-bold font-mono ${d.netPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                    Net: {formatPnl(d.netPnl)}
+                  </span>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Buys</p>
+                  <p className="text-lg font-bold font-mono text-emerald-400">{d.buys}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Sells</p>
+                  <p className="text-lg font-bold font-mono text-red-400">{d.sells}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Roundtrips</p>
+                  <p className="text-lg font-bold font-mono text-violet-400">{d.roundtrips}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Volume</p>
+                  <p className="text-lg font-bold font-mono text-blue-400">{d.volume?.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Buy Vol</p>
+                  <p className="text-sm font-mono text-slate-300">{d.buyVolume?.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Sell Vol</p>
+                  <p className="text-sm font-mono text-slate-300">{d.sellVolume?.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Avg BuyVWAP</p>
+                  <p className="text-sm font-mono text-blue-400">{formatPrice(d.avgBuyVwap)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600 mb-0.5">Avg SellVWAP</p>
+                  <p className="text-sm font-mono text-red-400">{formatPrice(d.avgSellVwap)}</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div className="flex items-center gap-4 mb-5">
+        <select
+          value={filterAgent}
+          onChange={(e) => { setFilterAgent(e.target.value); setFilterPairId(""); }}
+          className="rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-2.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer"
+        >
+          <option value="">All Bots</option>
+          {agents.map((a) => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+        <select
+          value={filterPairId}
+          onChange={(e) => setFilterPairId(e.target.value)}
+          className="rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-2.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer"
+        >
+          <option value="">All Pairs</option>
+          {tabFilteredPairs.filter(p => !filterAgent || p.agentName === filterAgent).map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.symbol1} / {p.symbol2} (#{p.id}) {p.status === "active" ? "●" : "○"}
+            </option>
+          ))}
+        </select>
+        <select
+          value={filterStatus}
+          onChange={(e) => setFilterStatus(e.target.value)}
+          className="rounded-xl border border-slate-700/50 bg-slate-800/40 text-slate-100 px-4 py-2.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all cursor-pointer"
+        >
+          <option value="">All Status</option>
+          <option value="open">Open</option>
+          <option value="filled">Filled</option>
+          <option value="closed">Closed</option>
+          <option value="cancelled">Cancelled</option>
+        </select>
+      </div>
+
+      {/* View Tabs: Trades / Roundtrips */}
+      <div className="flex items-center gap-2 mb-4">
+        {[
+          { key: "trades",     label: "Trades",     count: trades.length },
+          { key: "roundtrips", label: "Roundtrips", count: roundtrips.length },
+        ].map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => setViewTab(tab.key)}
+            className={`px-4 py-1.5 rounded-xl text-sm font-semibold border transition-all cursor-pointer flex items-center gap-2 ${
+              viewTab === tab.key
+                ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
+                : "bg-slate-900/60 border-slate-800/60 text-slate-500 hover:text-slate-300"
+            }`}
+          >
+            {tab.label}
+            <span className="text-xs font-mono opacity-70">({tab.count})</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Trade Logs Table */}
+      {viewTab === "trades" && (
+      <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm table-auto">
+            <thead>
+              <tr className="border-b border-slate-800/60">
+                <th className={thClass}>ID</th>
+                <th className={thClass}>Pair</th>
+                <th className={thClass}>Side</th>
+                <th className={thClass}>Status</th>
+                <th className={thClass}>Leg A</th>
+                <th className={thClass}>A VWAP</th>
+                <th className={thClass}>Leg B</th>
+                <th className={thClass}>B VWAP</th>
+                <th className={thClass}>Z-Score</th>
+                <th className={thClass}>Entry Spread $</th>
+                <th className={thClass}>Exit Spread $</th>
+                <th className={thClass}>Gross P&L</th>
+                <th className={thClass}>Commission</th>
+                <th className={thClass}>Taker Fee</th>
+                <th className={thClass}>Net P&L</th>
+                <th className={thClass}>Exch. P&L</th>
+                <th className={thClass}>Exec Filled</th>
+                <th className={thClass}>Hedge Filled</th>
+                <th className={thClass}>Created</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && trades.length === 0 ? (
+                <tr>
+                  <td colSpan={20} className="text-center py-12 text-slate-500 text-sm">Loading...</td>
+                </tr>
+              ) : trades.length === 0 ? (
+                <tr>
+                  <td colSpan={20} className="text-center py-12 text-slate-500 text-sm">No trades found</td>
+                </tr>
+              ) : (
+                trades.map((t) => {
+                  const isSignalLegB = t.legB_fillType === "signal" || ((t.legB_qty || 0) === 0 && !t.legB_orderId);
+                  return (
+                  <tr key={t.id} className="border-b border-slate-800/30 hover:bg-slate-800/20 transition-colors">
+                    <td className={`${tdClass} font-mono text-slate-400 text-xs`}>#{t.id}</td>
+                    <td className={tdClass}>
+                      <span className="text-xs font-mono text-slate-300">
+                        {pairMap[t.pairId] || `#${t.pairId}`}
+                      </span>
+                    </td>
+                    <td className={tdClass}>{sideBadge(t.side)}</td>
+                    <td className={tdClass}>{statusBadge(t.status)}</td>
+                    <td className={tdClass}>
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[10px] text-slate-500">{t.legA_exchange} {t.legA_symbol}</span>
+                        <span className="text-xs font-mono text-slate-300">
+                          <span className={t.legA_side === "buy" ? "text-emerald-400" : "text-red-400"}>{t.legA_side?.toUpperCase()}</span>
+                          {" "}{formatPrice(t.legA_price)} x {t.legA_qty ?? "-"}
+                        </span>
+                        {t.legA_orderId && (
+                          <span
+                            className="text-[10px] text-slate-400 font-mono cursor-pointer hover:text-blue-400 transition-colors"
+                            title={`Order ID: ${t.legA_orderId} — click to copy`}
+                            onClick={() => navigator.clipboard?.writeText(t.legA_orderId)}
+                          >
+                            #{t.legA_orderId}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs ${t.legA_side === 'buy' ? 'text-blue-400' : 'text-red-400'}`}>
+                      {t.legA_side === 'buy' ? (t.legA_buyVwap != null ? formatPrice(t.legA_buyVwap) : "-") : (t.legA_sellVwap != null ? formatPrice(t.legA_sellVwap) : "-")}
+                    </td>
+                    <td className={tdClass}>
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[10px] text-slate-500">{t.legB_exchange} {t.legB_symbol}</span>
+                        {isSignalLegB ? (
+                          <span className="text-xs font-mono text-cyan-400">
+                            SIGNAL {formatPrice(t.legB_price)} x 0
+                          </span>
+                        ) : (
+                          <span className="text-xs font-mono text-slate-300">
+                            <span className={t.legB_side === "buy" ? "text-emerald-400" : "text-red-400"}>{t.legB_side?.toUpperCase()}</span>
+                            {" "}{formatPrice(t.legB_price)} x {t.legB_qty ?? "-"}
+                          </span>
+                        )}
+                        {t.legB_orderId && (
+                          <span
+                            className="text-[10px] text-slate-400 font-mono cursor-pointer hover:text-blue-400 transition-colors"
+                            title={`Order ID: ${t.legB_orderId} — click to copy`}
+                            onClick={() => navigator.clipboard?.writeText(t.legB_orderId)}
+                          >
+                            #{t.legB_orderId}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs ${t.legB_side === 'buy' ? 'text-blue-400' : 'text-red-400'}`}>
+                      {isSignalLegB ? "-" : (t.legB_side === 'buy' ? (t.legB_buyVwap != null ? formatPrice(t.legB_buyVwap) : "-") : (t.legB_sellVwap != null ? formatPrice(t.legB_sellVwap) : "-"))}
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs text-slate-400`}>{t.zScoreAtEntry != null ? Number(t.zScoreAtEntry).toFixed(3) : "-"}</td>
+                    <td className={`${tdClass} font-mono text-xs text-cyan-400`}>{t.spreadAtEntry != null ? `$${Number(t.spreadAtEntry).toFixed(2)}` : "-"}</td>
+                    <td className={`${tdClass} font-mono text-xs text-amber-400`}>{t.spreadAtExit != null ? `$${Number(t.spreadAtExit).toFixed(2)}` : "-"}</td>
+                    <td className={`${tdClass} font-mono text-xs font-bold ${(t.legA_pnl != null || t.legB_pnl != null) ? (((t.legA_pnl ?? 0) + (t.legB_pnl ?? 0)) >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                      {(t.legA_pnl != null || t.legB_pnl != null) ? formatPnl((t.legA_pnl ?? 0) + (t.legB_pnl ?? 0)) : "-"}
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs ${t.commission != null ? (t.commission >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                      {t.commission != null ? `${t.commission >= 0 ? "+" : ""}${Math.abs(t.commission).toFixed(4)}` : "-"}
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs ${t.takerFeeUsd != null ? "text-red-400" : "text-slate-500"}`}>
+                      {t.takerFeeUsd != null ? `-${t.takerFeeUsd.toFixed(4)}` : "-"}
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs font-bold ${t.pnl != null ? (t.pnl >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                      {formatPnl(t.pnl)}
+                    </td>
+                    <td className={`${tdClass} font-mono text-xs ${t.exchangePnl != null ? (t.exchangePnl >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                      {t.exchangePnl != null ? formatPnl(t.exchangePnl) : "-"}
+                    </td>
+                    <td className={`${tdClass} text-xs text-slate-500 whitespace-nowrap`}>{formatDate(t.legA_filledAt)}</td>
+                    <td className={`${tdClass} text-xs text-slate-500 whitespace-nowrap`}>{isSignalLegB ? "signal" : formatDate(t.legB_filledAt)}</td>
+                    <td className={`${tdClass} text-xs text-slate-500 whitespace-nowrap`}>{formatDate(t.createdAt)}</td>
+                  </tr>
+                )})
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      )}
+
+      {/* Roundtrips Table */}
+      {viewTab === "roundtrips" && (
+      <div className="rounded-2xl border border-slate-800/80 bg-gradient-to-b from-slate-900/90 to-[#0a0e17] overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm table-auto">
+            <thead>
+              <tr className="border-b border-slate-800/60">
+                <th className={thClass}>Pos ID</th>
+                <th className={thClass}>Pair</th>
+                <th className={thClass}>Dir</th>
+                <th className={thClass}>State</th>
+                <th className={thClass}>Entry Trade</th>
+                <th className={thClass}>Exit Trade</th>
+                <th className={thClass}>Entry Time</th>
+                <th className={thClass}>Exit Time</th>
+                <th className={thClass}>Hold</th>
+                <th className={thClass}>Entry: Fut / Perp</th>
+                <th className={thClass}>Exit: Fut / Perp</th>
+                <th className={thClass}>Entry Spread $</th>
+                <th className={thClass}>Exit Spread $</th>
+                <th className={thClass}>Spread Δ $</th>
+                <th className={thClass}>Gross P&L</th>
+                <th className={thClass}>Commission</th>
+                <th className={thClass}>Taker Fee</th>
+                <th className={thClass}>Net P&L</th>
+                <th className={thClass}>Exit Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && roundtrips.length === 0 ? (
+                <tr>
+                  <td colSpan={19} className="text-center py-12 text-slate-500 text-sm">Loading...</td>
+                </tr>
+              ) : roundtrips.length === 0 ? (
+                <tr>
+                  <td colSpan={19} className="text-center py-12 text-slate-500 text-sm">No roundtrips found</td>
+                </tr>
+              ) : (
+                roundtrips.map((r) => {
+                  const stateColor = {
+                    closed: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10",
+                    open: "text-blue-400 border-blue-500/30 bg-blue-500/10",
+                    pending_entry: "text-violet-400 border-violet-500/30 bg-violet-500/10",
+                    pending_exit: "text-amber-400 border-amber-500/30 bg-amber-500/10",
+                    failed: "text-red-400 border-red-500/30 bg-red-500/10",
+                  }[r.state] || "text-slate-400 border-slate-700 bg-slate-800/20";
+                  const spreadChange = r.spreadChange != null ? Number(r.spreadChange) : null;
+                  const spreadChangeColor = spreadChange == null ? "text-slate-500"
+                    : r.direction === 'long' ? (spreadChange < 0 ? "text-emerald-400" : "text-red-400")
+                    : (spreadChange > 0 ? "text-emerald-400" : "text-red-400");
+                  const holdMs = r.holdMs ? Number(r.holdMs) : null;
+                  const holdStr = holdMs == null ? "-"
+                    : holdMs < 60000 ? `${Math.floor(holdMs / 1000)}s`
+                    : holdMs < 3600000 ? `${Math.floor(holdMs / 60000)}m ${Math.floor((holdMs % 60000) / 1000)}s`
+                    : `${Math.floor(holdMs / 3600000)}h ${Math.floor((holdMs % 3600000) / 60000)}m`;
+                  const pairMeta = pairById[r.pairId] || {};
+                  const isUnilateral = !!pairMeta.unilateralMode;
+                  return (
+                    <tr key={r.id} className="border-b border-slate-800/30 hover:bg-slate-800/20 transition-colors">
+                      <td className={`${tdClass} font-mono text-slate-400 text-xs`}>#{r.id}</td>
+                      <td className={tdClass}>
+                        <span className="text-xs font-mono text-slate-300">{pairMap[r.pairId] || `#${r.pairId}`}</span>
+                      </td>
+                      <td className={tdClass}>
+                        <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                          r.direction === 'long'
+                            ? 'text-violet-400 border-violet-500/30 bg-violet-500/10'
+                            : 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10'
+                        }`}>
+                          {isUnilateral ? (r.direction === 'long' ? 'Uni Short Fut' : 'Uni Long Fut') : (r.direction === 'long' ? 'Short Basis' : 'Long Basis')}
+                        </span>
+                      </td>
+                      <td className={tdClass}>
+                        <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${stateColor}`}>
+                          {r.state?.replace('_', ' ')}
+                        </span>
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs text-slate-400`}>
+                        {r.entryTradeId ? `#${r.entryTradeId}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs text-slate-400`}>
+                        {r.exitTradeId ? `#${r.exitTradeId}` : <span className="text-slate-600">pending</span>}
+                      </td>
+                      <td className={`${tdClass} text-xs text-slate-500 whitespace-nowrap`}>{formatDate(r.entryTime)}</td>
+                      <td className={`${tdClass} text-xs text-slate-500 whitespace-nowrap`}>{formatDate(r.exitTime)}</td>
+                      <td className={`${tdClass} font-mono text-xs text-slate-400`}>{holdStr}</td>
+                      <td className={tdClass}>
+                        <div className="flex flex-col gap-0.5 font-mono text-xs">
+                          <span className="text-red-400">Fut: {r.legA_entryPrice != null ? Number(r.legA_entryPrice).toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1}) : "-"}</span>
+                          <span className="text-emerald-400">Perp{isUnilateral ? " (signal)" : ""}: {r.legB_entryPrice != null ? Number(r.legB_entryPrice).toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1}) : "-"}</span>
+                        </div>
+                      </td>
+                      <td className={tdClass}>
+                        <div className="flex flex-col gap-0.5 font-mono text-xs">
+                          <span className="text-red-400">Fut: {r.legA_exitPrice != null ? Number(r.legA_exitPrice).toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1}) : "-"}</span>
+                          <span className="text-emerald-400">Perp{isUnilateral ? " (signal)" : ""}: {r.legB_exitPrice != null ? Number(r.legB_exitPrice).toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1}) : "-"}</span>
+                        </div>
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs text-cyan-400`}>
+                        {r.entrySpread != null ? `$${Number(r.entrySpread).toFixed(2)}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs text-amber-400`}>
+                        {r.exitSpread != null ? `$${Number(r.exitSpread).toFixed(2)}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs font-bold ${spreadChangeColor}`}>
+                        {spreadChange != null ? `${spreadChange >= 0 ? "+" : ""}$${spreadChange.toFixed(2)}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs font-bold ${r.grossPnl != null ? (r.grossPnl >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                        {r.grossPnl != null ? formatPnl(r.grossPnl) : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs ${r.commission != null ? (r.commission >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                        {r.commission != null ? `${r.commission >= 0 ? "+" : ""}$${Math.abs(r.commission).toFixed(4)}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs ${r.takerFeeUsd != null ? "text-red-400" : "text-slate-500"}`}>
+                        {r.takerFeeUsd != null ? `-$${r.takerFeeUsd.toFixed(4)}` : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs font-bold ${r.netPnl != null ? (r.netPnl >= 0 ? "text-emerald-400" : "text-red-400") : "text-slate-500"}`}>
+                        {r.netPnl != null ? formatPnl(r.netPnl) : "-"}
+                      </td>
+                      <td className={`${tdClass} font-mono text-xs text-slate-500`}>
+                        {r.exitReason ?? "-"}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      )}
+    </>
+  );
+}
