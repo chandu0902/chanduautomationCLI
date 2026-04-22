@@ -104,7 +104,14 @@ IMPORTANT: After completing the above task, update the file at D:/Project/210420
 - Which files were modified and which branch is active
 Keep it under 30 lines. Overwrite the whole file each time.
 
-ALSO IMPORTANT: Always end your response with a plain-text summary of what you found or did — even for simple questions. Never finish silently with only tool calls. The user reads your final text message on Telegram.`;
+ALSO IMPORTANT: Always end your response with a plain-text summary of what you found or did — even for simple questions. Never finish silently with only tool calls. The user reads your final text message on Telegram.
+
+COMMIT RULE: After every task that modifies any file, run these git commands:
+1. Check current branch with: git branch --show-current
+2. If the current branch is "main", create and switch to a new branch: git checkout -b task/$(date +%s)
+3. Stage all modified files: git add -A
+4. Commit with a short message describing what was done: git commit -m "short description"
+Never force-push. Never commit to main directly.`;
 
 // ─── Claude spawner ───────────────────────────────────────────────────────────
 
