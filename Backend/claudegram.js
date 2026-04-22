@@ -102,7 +102,9 @@ IMPORTANT: After completing the above task, update the file at D:/Project/210420
 - What was just done (1-3 bullet points)
 - What is currently in progress or pending
 - Which files were modified and which branch is active
-Keep it under 30 lines. Overwrite the whole file each time.`;
+Keep it under 30 lines. Overwrite the whole file each time.
+
+ALSO IMPORTANT: Always end your response with a plain-text summary of what you found or did — even for simple questions. Never finish silently with only tool calls. The user reads your final text message on Telegram.`;
 
 // ─── Claude spawner ───────────────────────────────────────────────────────────
 
@@ -171,16 +173,12 @@ function spawnClaude(args, stdinText, chatId) {
       console.log(`[Claude][${label}] Exited with code ${code} after ${elapsed}s | stdout=${stdout.length}b stderr=${stderr.length}b`);
       try {
         const json = JSON.parse(stdout.trim());
-        console.log(`[Claude][${label}] Full JSON keys: ${Object.keys(json).join(", ")}`);
-        console.log(`[Claude][${label}] Full stdout: ${stdout.slice(0, 500)}`);
-        // Claude Code may use different field names depending on version/mode
         const text = json.result || json.content || json.message || json.text || json.response || "";
         const sessionId = json.session_id || json.sessionId || null;
-        console.log(`[Claude][${label}] Parsed JSON ok | session=${sessionId} | text_len=${text.length}`);
+        console.log(`[Claude][${label}] Parsed JSON ok | session=${sessionId} | text_len=${text.length} | turns=${json.num_turns || "?"} | cost=$${(json.total_cost_usd || 0).toFixed(4)}`);
         resolve({ code, text, sessionId });
       } catch (e) {
-        console.log(`[Claude][${label}] JSON parse failed (${e.message})`);
-        console.log(`[Claude][${label}] Raw stdout: ${stdout.slice(0, 500)}`);
+        console.log(`[Claude][${label}] JSON parse failed (${e.message}) | raw: ${stdout.slice(0, 300)}`);
         resolve({ code, text: (stdout || stderr || "").trim(), sessionId: null });
       }
     });
