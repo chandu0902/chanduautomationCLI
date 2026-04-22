@@ -171,14 +171,16 @@ function spawnClaude(args, stdinText, chatId) {
       console.log(`[Claude][${label}] Exited with code ${code} after ${elapsed}s | stdout=${stdout.length}b stderr=${stderr.length}b`);
       try {
         const json = JSON.parse(stdout.trim());
-        console.log(`[Claude][${label}] Parsed JSON ok | session=${json.session_id} | result_len=${(json.result || "").length}`);
-        resolve({
-          code,
-          text: json.result || "",
-          sessionId: json.session_id || null,
-        });
+        console.log(`[Claude][${label}] Full JSON keys: ${Object.keys(json).join(", ")}`);
+        console.log(`[Claude][${label}] Full stdout: ${stdout.slice(0, 500)}`);
+        // Claude Code may use different field names depending on version/mode
+        const text = json.result || json.content || json.message || json.text || json.response || "";
+        const sessionId = json.session_id || json.sessionId || null;
+        console.log(`[Claude][${label}] Parsed JSON ok | session=${sessionId} | text_len=${text.length}`);
+        resolve({ code, text, sessionId });
       } catch (e) {
-        console.log(`[Claude][${label}] JSON parse failed (${e.message}) — returning raw output`);
+        console.log(`[Claude][${label}] JSON parse failed (${e.message})`);
+        console.log(`[Claude][${label}] Raw stdout: ${stdout.slice(0, 500)}`);
         resolve({ code, text: (stdout || stderr || "").trim(), sessionId: null });
       }
     });
