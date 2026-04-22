@@ -112,6 +112,14 @@ function spawnClaude(args, stdinText, chatId) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    const startedAt = Date.now();
+
+    const label = args[0] === "--resume" ? `resume:${args[1].slice(0, 8)}` : "new";
+    console.log(`[Claude][${label}] Spawning: claude ${args.slice(0, 3).join(" ")} ...`);
+    console.log(`[Claude][${label}] CWD: ${WORK_DIR}`);
+    if (stdinText) {
+      console.log(`[Claude][${label}] Stdin (first 200 chars): ${stdinText.slice(0, 200)}`);
+    }
 
     const proc = spawn(CLAUDE_EXE, args, {
       cwd: WORK_DIR,
@@ -119,15 +127,38 @@ function spawnClaude(args, stdinText, chatId) {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    console.log(`[Claude][${label}] PID: ${proc.pid}`);
+
     if (stdinText) {
       proc.stdin.write(stdinText);
     }
     proc.stdin.end();
 
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    // Heartbeat — log every 30s so we know it's still running
+    const heartbeat = setInterval(() => {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      console.log(`[Claude][${label}] Still running... ${elapsed}s elapsed | stdout=${stdout.length}b stderr=${stderr.length}b`);
+    }, 30000);
+
+    proc.stdout.on("data", (d) => {
+      const chunk = d.toString();
+      stdout += chunk;
+      console.log(`[Claude][${label}] stdout chunk (${chunk.length}b): ${chunk.slice(0, 120).replace(/\n/g, "\\n")}`);
+    });
+
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      // Log each stderr line individually so we can see Claude's progress
+      for (const line of chunk.split("\n")) {
+        if (line.trim()) console.log(`[Claude][${label}] stderr: ${line}`);
+      }
+    });
 
     const timer = setTimeout(() => {
+      clearInterval(heartbeat);
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      console.log(`[Claude][${label}] TIMEOUT after ${elapsed}s — killing PID ${proc.pid}`);
       proc.kill();
       bot.sendMessage(chatId, "⏰ Timeout after 10 minutes.");
       resolve({ code: -1, text: "", sessionId: null });
@@ -135,20 +166,27 @@ function spawnClaude(args, stdinText, chatId) {
 
     proc.on("close", (code) => {
       clearTimeout(timer);
+      clearInterval(heartbeat);
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      console.log(`[Claude][${label}] Exited with code ${code} after ${elapsed}s | stdout=${stdout.length}b stderr=${stderr.length}b`);
       try {
         const json = JSON.parse(stdout.trim());
+        console.log(`[Claude][${label}] Parsed JSON ok | session=${json.session_id} | result_len=${(json.result || "").length}`);
         resolve({
           code,
           text: json.result || "",
           sessionId: json.session_id || null,
         });
-      } catch {
+      } catch (e) {
+        console.log(`[Claude][${label}] JSON parse failed (${e.message}) — returning raw output`);
         resolve({ code, text: (stdout || stderr || "").trim(), sessionId: null });
       }
     });
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      clearInterval(heartbeat);
+      console.log(`[Claude][${label}] Spawn error: ${err.message}`);
       resolve({ code: -1, text: err.message, sessionId: null });
     });
   });
