@@ -7,7 +7,6 @@ const os = require("os");
 
 const token = "8764353844:AAGW3lOL3zA6iif5HU7K188D6ej8x4KByPM";
 const allowedChatId = 7142981840;
-const WORK_DIR = path.resolve(__dirname, "..");
 
 const CLAUDE_EXE = path.join(
   process.env.APPDATA || "",
@@ -19,16 +18,95 @@ const CLAUDE_EXE = path.join(
   "claude.exe",
 );
 
+// Detect project root by walking up from __dirname until we find CLAUDE.md
+function findProjectRoot(startDir) {
+  let dir = startDir;
+  while (true) {
+    if (fs.existsSync(path.join(dir, "CLAUDE.md"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) throw new Error("Could not find project root (no CLAUDE.md found)");
+    dir = parent;
+  }
+}
+
+const WORK_DIR = findProjectRoot(__dirname);
+
+// Persistent storage paths — always relative to project root, not __dirname
+const SESSIONS_FILE = path.join(WORK_DIR, ".claude-sessions.json");
+const WORK_CONTEXT_FILE = path.join(WORK_DIR, "work_context.md");
+
 const bot = new TelegramBot(token, { polling: true });
 
 console.log("🚀 Claude Telegram Bot Running");
 console.log("📁 Working dir:", WORK_DIR);
 console.log("🤖 Claude EXE:", CLAUDE_EXE);
 
-// chatId → sessionId
-const sessions = new Map();
+// ─── Session persistence ─────────────────────────────────────────────────────
 
-const COMMON_ARGS = ["--allowedTools", "Read,Edit,Bash,Write", "--output-format", "json"];
+function loadSessions() {
+  try {
+    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
+      return new Map(Object.entries(data));
+    }
+  } catch (e) {
+    console.error("[Sessions] Failed to load sessions file:", e.message);
+  }
+  return new Map();
+}
+
+function saveSessions(sessions) {
+  try {
+    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+    const obj = {};
+    for (const [k, v] of sessions) obj[k] = v;
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.error("[Sessions] Failed to save sessions file:", e.message);
+  }
+}
+
+// chatId → sessionId (loaded from disk on startup)
+const sessions = loadSessions();
+console.log(`[Sessions] Loaded ${sessions.size} persisted session(s)`);
+
+// ─── Work context ─────────────────────────────────────────────────────────────
+
+function loadWorkContext() {
+  try {
+    if (fs.existsSync(WORK_CONTEXT_FILE)) {
+      return fs.readFileSync(WORK_CONTEXT_FILE, "utf8").trim();
+    }
+  } catch (e) {}
+  return null;
+}
+
+function buildFreshSessionPrompt(userPrompt) {
+  const context = loadWorkContext();
+  if (!context) return userPrompt;
+
+  return `PREVIOUS WORK CONTEXT (session expired, resuming from saved state):
+---
+${context}
+---
+
+USER REQUEST: ${userPrompt}`;
+}
+
+// Appended to every prompt so Claude keeps work_context.md up to date
+const CONTEXT_UPDATE_SUFFIX = `
+
+---
+IMPORTANT: After completing the above task, update the file at D:/Project/21042026/work_context.md with a brief summary of:
+- What was just done (1-3 bullet points)
+- What is currently in progress or pending
+- Which files were modified and which branch is active
+Keep it under 30 lines. Overwrite the whole file each time.`;
+
+// ─── Claude spawner ───────────────────────────────────────────────────────────
+
+const COMMON_ARGS = ["--allowedTools", "Read,Edit,Bash,Write,Glob,Grep", "--output-format", "json"];
 
 function spawnClaude(args, stdinText, chatId) {
   return new Promise((resolve) => {
@@ -51,9 +129,9 @@ function spawnClaude(args, stdinText, chatId) {
 
     const timer = setTimeout(() => {
       proc.kill();
-      bot.sendMessage(chatId, "⏰ Timeout after 3 minutes.");
+      bot.sendMessage(chatId, "⏰ Timeout after 10 minutes.");
       resolve({ code: -1, text: "", sessionId: null });
-    }, 180000);
+    }, 600000);
 
     proc.on("close", (code) => {
       clearTimeout(timer);
@@ -78,33 +156,42 @@ function spawnClaude(args, stdinText, chatId) {
 
 async function runClaude(chatId, prompt) {
   console.log(`[${new Date().toISOString()}] Prompt: ${prompt.slice(0, 100)}`);
-  bot.sendMessage(chatId, `⏳ Running Claude...\n${prompt.slice(0, 80)}`);
 
-  const sessionId = sessions.get(chatId);
+  const sessionId = sessions.get(String(chatId));
+  const promptWithSuffix = prompt + CONTEXT_UPDATE_SUFFIX;
   let result;
 
   if (sessionId) {
+    bot.sendMessage(chatId, `⏳ Continuing conversation...\n${prompt.slice(0, 80)}`);
     console.log(`[${new Date().toISOString()}] Resuming session: ${sessionId}`);
     result = await spawnClaude(
       ["--resume", sessionId, ...COMMON_ARGS],
-      prompt,
+      promptWithSuffix,
       chatId,
     );
 
     if (result.code !== 0) {
-      console.log(`[${new Date().toISOString()}] Resume failed — starting fresh`);
-      sessions.delete(chatId);
-      result = await spawnClaude(["-p", prompt, ...COMMON_ARGS], null, chatId);
+      console.log(`[${new Date().toISOString()}] Resume failed — starting fresh with context`);
+      sessions.delete(String(chatId));
+      saveSessions(sessions);
+      const freshPrompt = buildFreshSessionPrompt(promptWithSuffix);
+      const hasContext = !!loadWorkContext();
+      bot.sendMessage(chatId, `🔄 Session expired — starting new session${hasContext ? " with previous work context" : ""}...`);
+      result = await spawnClaude(["-p", freshPrompt, ...COMMON_ARGS], null, chatId);
     }
   } else {
-    result = await spawnClaude(["-p", prompt, ...COMMON_ARGS], null, chatId);
+    const freshPrompt = buildFreshSessionPrompt(promptWithSuffix);
+    const hasContext = !!loadWorkContext();
+    bot.sendMessage(chatId, `🆕 Starting new session${hasContext ? " with previous work context" : ""}...\n${prompt.slice(0, 80)}`);
+    result = await spawnClaude(["-p", freshPrompt, ...COMMON_ARGS], null, chatId);
   }
 
   const { code, text, sessionId: newSessionId } = result;
   console.log(`[${new Date().toISOString()}] Exit: ${code}, Session: ${newSessionId}, Output: ${text.length} chars`);
 
   if (newSessionId) {
-    sessions.set(chatId, newSessionId);
+    sessions.set(String(chatId), newSessionId);
+    saveSessions(sessions);
   }
 
   if (!text) {
@@ -170,14 +257,23 @@ bot.on("message", async (msg) => {
   if (msg.text === "/start") {
     bot.sendMessage(
       chatId,
-      "✅ Claude Code bot is running!\n\nSend me:\n• Any text instruction\n• A photo/screenshot with a caption describing what to do\n• /new — start a fresh session",
+      "✅ Claude Code bot is running!\n\nSend me:\n• Any text instruction\n• A photo/screenshot with a caption describing what to do\n• /new — start a fresh session\n• /status — show current session info",
     );
     return;
   }
 
   if (msg.text === "/new") {
-    sessions.delete(chatId);
+    sessions.delete(String(chatId));
+    saveSessions(sessions);
     bot.sendMessage(chatId, "🆕 Session cleared. Starting fresh on your next message.");
+    return;
+  }
+
+  if (msg.text === "/status") {
+    const sid = sessions.get(String(chatId));
+    const ctx = loadWorkContext();
+    const ctxPreview = ctx ? ctx.slice(0, 300) + (ctx.length > 300 ? "..." : "") : "No saved context yet.";
+    bot.sendMessage(chatId, `📋 Session: ${sid ? sid.slice(0, 20) + "..." : "none (will start fresh)"}\n\nLast work context:\n${ctxPreview}`);
     return;
   }
 
