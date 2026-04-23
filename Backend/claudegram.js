@@ -1,5 +1,5 @@
 const TelegramBot = require("node-telegram-bot-api");
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const https = require("https");
@@ -112,6 +112,36 @@ COMMIT RULE: After every task that modifies any file, run these git commands:
 3. Stage all modified files: git add -A
 4. Commit with a short message describing what was done: git commit -m "short description"
 Never force-push. Never commit to main directly.`;
+
+// ─── Auto git commit ─────────────────────────────────────────────────────────
+
+function autoGitCommit(promptSummary) {
+  try {
+    const git = (cmd) => execSync(cmd, { cwd: WORK_DIR, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+
+    // Check if there are any changes to commit
+    const status = git("git status --porcelain");
+    if (!status) return null; // nothing changed
+
+    // If on main, create a new task branch
+    const branch = git("git branch --show-current");
+    let targetBranch = branch;
+    if (branch === "main" || branch === "") {
+      targetBranch = `task/${Date.now()}`;
+      git(`git checkout -b ${targetBranch}`);
+    }
+
+    // Stage and commit
+    git("git add -A");
+    const msg = promptSummary.replace(/"/g, "'").slice(0, 72);
+    git(`git commit -m "${msg}"`);
+
+    return targetBranch;
+  } catch (e) {
+    console.error("[AutoGit] Error:", e.message);
+    return null;
+  }
+}
 
 // ─── Claude spawner ───────────────────────────────────────────────────────────
 
@@ -249,7 +279,12 @@ async function runClaude(chatId, prompt) {
   }
 
   if (code === 0) {
-    bot.sendMessage(chatId, "✅ Task completed successfully.");
+    const branch = autoGitCommit(prompt.slice(0, 72));
+    if (branch) {
+      bot.sendMessage(chatId, `✅ Task completed.\n🌿 Saved to branch: \`${branch}\``);
+    } else {
+      bot.sendMessage(chatId, "✅ Task completed. (No file changes to commit.)");
+    }
   } else {
     bot.sendMessage(chatId, `❌ Claude exited with code ${code}. Check output above for errors.`);
   }
